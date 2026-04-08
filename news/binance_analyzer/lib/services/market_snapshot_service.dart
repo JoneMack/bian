@@ -29,6 +29,7 @@ class MarketSnapshotService {
     List<CoinData> top3;
     StrategyBacktestReport? engineReport;
     List<EntryAlertSignal> entryAlerts = const [];
+    List<EntryAlertSignal> exitAlerts = const [];
 
     try {
       final symbols = coins.map((coin) => coin.symbol).toList();
@@ -36,7 +37,7 @@ class MarketSnapshotService {
         _binance.fetchWatchlistKlines(
           symbols: symbols,
           interval: '1d',
-          limit: 75,
+          limit: 90,
           forceRefresh: forceRefresh,
         ),
         _binance.fetchWatchlistKlines(
@@ -58,6 +59,7 @@ class MarketSnapshotService {
       top3 = engine.top3;
       engineReport = engine.report;
       entryAlerts = engine.entryAlerts;
+      exitAlerts = engine.exitAlerts;
     } catch (_) {
       analyzed = CoinAnalyzer.analyze(coins);
       top3 = CoinAnalyzer.top3Picks(analyzed);
@@ -69,6 +71,7 @@ class MarketSnapshotService {
       updatedAt: DateTime.now(),
       engineReport: engineReport,
       entryAlerts: entryAlerts,
+      exitAlerts: exitAlerts,
       watchlistSymbols: watchlistSymbols,
     );
   }

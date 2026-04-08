@@ -468,7 +468,7 @@ class _CoinDetailScreenState extends State<CoinDetailScreen> {
             mainAxisSpacing: 12,
             children: [
               _MetricCard(
-                label: '30天变化',
+                label: '45天变化',
                 value: CoinInsightHelper.formatPercent(coin.thirtyDayChange),
                 tone: coin.thirtyDayChange >= 0 ? AppTheme.green : AppTheme.red,
               ),

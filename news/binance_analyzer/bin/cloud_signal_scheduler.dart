@@ -160,6 +160,15 @@ class _CloudSignalSchedulerApp {
   Future<void> start() async {
     await _loadArtifacts();
 
+    stdout.writeln(
+      'Push config: publish=${config.publishPush} '
+      'provider=${config.pushProvider.name} '
+      'effective=${_effectivePushProviderName() ?? 'none'} '
+      'feishuConfigured=${_hasFeishuWebhook()} '
+      'ntfyConfigured=${_hasNtfyTopic()} '
+      'dedupe=${config.dedupePush}',
+    );
+
     if (config.runOnce) {
       await _runCycle(trigger: 'run_once');
       return;
@@ -228,10 +237,12 @@ class _CloudSignalSchedulerApp {
           'replayEndpoint': '/replay',
           'marketSnapshotEndpoint': '/market-snapshot',
           'runEndpoint': '/run',
+          'pushTestEndpoint': '/push-test',
           'internalScheduler': config.enableInternalScheduler,
           'manualRunRequiresToken': (config.runnerToken?.isNotEmpty ?? false),
           'marketSnapshotCacheSeconds': config.marketSnapshotTtl.inSeconds,
           'pushProvider': config.pushProvider.name,
+          'effectivePushProvider': _effectivePushProviderName(),
         });
         return;
       }
@@ -313,6 +324,38 @@ class _CloudSignalSchedulerApp {
         return;
       }
 
+      if ((request.method == 'GET' || request.method == 'POST') &&
+          path == '/push-test') {
+        if (!_isAuthorized(request)) {
+          await _writeJson(request.response, HttpStatus.forbidden, {
+            'error': 'manual push test disabled or invalid RUNNER_TOKEN',
+          });
+          return;
+        }
+
+        final queryProvider = request.uri.queryParameters['provider'];
+        final provider = (queryProvider == null || queryProvider.trim().isEmpty)
+            ? config.pushProvider
+            : parsePushProvider(queryProvider);
+
+        final result = await _service.publishTestMessage(
+          provider: provider,
+          feishuWebhookUrl: config.feishuWebhookUrl,
+          topic: config.ntfyTopic,
+          server: config.ntfyServer,
+          message: request.uri.queryParameters['message'],
+        );
+
+        final statusCode =
+            result.sent ? HttpStatus.ok : HttpStatus.badRequest;
+        await _writeJson(request.response, statusCode, {
+          'status': result.sent ? 'ok' : 'skipped',
+          'result': result.toJson(),
+          ..._pushConfigPayload(),
+        });
+        return;
+      }
+
       await _writeJson(request.response, HttpStatus.notFound, {
         'error': 'not found',
       });
@@ -373,7 +416,9 @@ class _CloudSignalSchedulerApp {
       stdout.writeln(
         '[${result.generatedAt.toIso8601String()}] $trigger '
         'preset=${result.engine.report.presetLabel} '
-        'push=${result.pushResult.status}',
+        'push=${result.pushResult.status} '
+        'provider=${result.pushResult.provider} '
+        'message=${result.pushResult.message}',
       );
     } catch (error, stackTrace) {
       _lastRunAt = DateTime.now();
@@ -418,9 +463,6 @@ class _CloudSignalSchedulerApp {
       'nextRunAt': _nextRunAt?.toIso8601String(),
       'runCount': _runCount,
       'intervalMinutes': config.interval.inMinutes,
-      'publishPush': config.publishPush,
-      'dedupePush': config.dedupePush,
-      'pushProvider': config.pushProvider.name,
       'dailyReportPath': config.dailyReportPath,
       'replayReportPath': config.replayReportPath,
       'marketSnapshotCacheSeconds': config.marketSnapshotTtl.inSeconds,
@@ -430,7 +472,44 @@ class _CloudSignalSchedulerApp {
       'latestTop3': (_latestReport?['top3'] as List<dynamic>? ?? const [])
           .take(3)
           .toList(),
+      ..._pushConfigPayload(),
     };
+  }
+
+  Map<String, dynamic> _pushConfigPayload() {
+    return {
+      'publishPush': config.publishPush,
+      'dedupePush': config.dedupePush,
+      'pushProvider': config.pushProvider.name,
+      'effectivePushProvider': _effectivePushProviderName(),
+      'hasRunnerToken': (config.runnerToken?.trim().isNotEmpty ?? false),
+      'hasFeishuWebhook': _hasFeishuWebhook(),
+      'hasNtfyTopic': _hasNtfyTopic(),
+      'feishuWebhookHost': _feishuWebhookHost(),
+    };
+  }
+
+  bool _hasFeishuWebhook() => config.feishuWebhookUrl?.trim().isNotEmpty ?? false;
+
+  bool _hasNtfyTopic() => config.ntfyTopic?.trim().isNotEmpty ?? false;
+
+  String? _effectivePushProviderName() {
+    switch (config.pushProvider) {
+      case PushProvider.feishu:
+        return _hasFeishuWebhook() ? PushProvider.feishu.name : null;
+      case PushProvider.ntfy:
+        return _hasNtfyTopic() ? PushProvider.ntfy.name : null;
+      case PushProvider.auto:
+        if (_hasFeishuWebhook()) return PushProvider.feishu.name;
+        if (_hasNtfyTopic()) return PushProvider.ntfy.name;
+        return null;
+    }
+  }
+
+  String? _feishuWebhookHost() {
+    final raw = config.feishuWebhookUrl?.trim() ?? '';
+    if (raw.isEmpty) return null;
+    return Uri.tryParse(raw)?.host;
   }
 
   List<String> _requestedSymbolsFrom(HttpRequest request) {

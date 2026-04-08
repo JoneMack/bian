@@ -89,9 +89,70 @@ void main() {
     expect(ntfyResult.status, 'sent');
     expect(ntfyResult.provider, 'ntfy');
   });
+
+  test('publishTestMessage sends feishu test push when configured', () async {
+    final client = MockClient((request) async {
+      expect(
+        request.url.toString(),
+        'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook',
+      );
+      final payload = jsonDecode(request.body) as Map<String, dynamic>;
+      expect(payload['msg_type'], 'text');
+      expect(
+        (payload['content'] as Map<String, dynamic>)['text'],
+        contains('测试推送'),
+      );
+      return http.Response('{"code":0,"msg":"success"}', 200);
+    });
+
+    final service = SignalRunnerService(httpClient: client);
+    final result = await service.publishTestMessage(
+      provider: PushProvider.auto,
+      feishuWebhookUrl:
+          'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook',
+    );
+
+    expect(result.sent, isTrue);
+    expect(result.provider, 'feishu');
+    expect(result.status, 'sent_test');
+  });
+
+  test('publishSignal also sends when only sell signals are actionable', () async {
+    final tempDir = await Directory.systemTemp.createTemp('signal-runner-test-');
+    addTearDown(() => tempDir.delete(recursive: true));
+
+    final client = MockClient((request) async {
+      final payload = jsonDecode(request.body) as Map<String, dynamic>;
+      final text = (payload['content'] as Map<String, dynamic>)['text'] as String;
+      expect(text, contains('卖出信号'));
+      expect(text, contains('止盈减仓'));
+      return http.Response('{"code":0,"msg":"success"}', 200);
+    });
+
+    final service = SignalRunnerService(httpClient: client);
+    final result = await service.publishSignal(
+      engine: _engineFixture(
+        entryShouldNotify: false,
+        exitShouldNotify: true,
+      ),
+      policy: EntrySignalPolicy.defaultPolicy,
+      provider: PushProvider.feishu,
+      feishuWebhookUrl:
+          'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook',
+      dedupe: true,
+      statePath: '${tempDir.path}/push_state.json',
+    );
+
+    expect(result.sent, isTrue);
+    expect(result.provider, 'feishu');
+    expect(result.status, 'sent');
+  });
 }
 
-RecommendationEngineResult _engineFixture() {
+RecommendationEngineResult _engineFixture({
+  bool entryShouldNotify = true,
+  bool exitShouldNotify = true,
+}) {
   final coin = CoinData(
     symbol: 'FETUSDT',
     lastPrice: 1.23,
@@ -123,7 +184,7 @@ RecommendationEngineResult _engineFixture() {
       positiveDaysRate: 0.71,
       generatedAt: DateTime(2026, 4, 3, 12),
     ),
-    entryAlerts: const [
+    entryAlerts: [
       EntryAlertSignal(
         symbol: 'FET',
         timingLabel: '可入场',
@@ -135,7 +196,22 @@ RecommendationEngineResult _engineFixture() {
         volumeRatio: 1.6,
         breakoutDistance: 0.9,
         pullbackPercent: 1.2,
-        shouldNotify: true,
+        shouldNotify: entryShouldNotify,
+      ),
+    ],
+    exitAlerts: [
+      EntryAlertSignal(
+        symbol: 'FET',
+        timingLabel: '止盈减仓',
+        timingReason: '1h MA8 跌破 MA21；距18h高点回撤 4.20%',
+        currentPrice: 1.23,
+        dayChangePercent: -4.6,
+        totalScore: 0.88,
+        entryScore: 0.74,
+        volumeRatio: 0,
+        breakoutDistance: -2.1,
+        pullbackPercent: 4.2,
+        shouldNotify: exitShouldNotify,
       ),
     ],
   );

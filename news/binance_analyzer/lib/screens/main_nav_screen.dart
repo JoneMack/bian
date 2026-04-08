@@ -133,7 +133,11 @@ class _MainNavScreenState extends State<MainNavScreen> {
         forceRefresh: !silent,
       );
 
-      await _history.saveTodayPicks(snapshot.top3);
+      await _history.saveTodayFeishuSignals(
+        entryAlerts: snapshot.entryAlerts,
+        exitAlerts: snapshot.exitAlerts,
+        marketCoins: snapshot.allCoins,
+      );
       await _history.settleYesterday(snapshot.allCoins);
       await _startRealtime(snapshot.watchlistSymbols);
 

@@ -9,6 +9,8 @@ class PickRecord {
   final double entryScore;
   final String recommendation;
   final String timingLabel;
+  final String signalType;
+  final String signalSource;
   double? exitPrice; // 次日检测价格
   bool? isWin; // 是否盈利
 
@@ -20,14 +22,24 @@ class PickRecord {
     this.entryScore = 0,
     this.recommendation = '',
     this.timingLabel = '',
+    this.signalType = 'buy',
+    this.signalSource = 'legacy',
     this.exitPrice,
     this.isWin,
   });
 
-  double get changePercent {
+  bool get isSellSignal => signalType == 'sell';
+
+  bool get isFeishuSignal => signalSource == 'feishu';
+
+  String get signalTypeLabel => isSellSignal ? '卖出' : '买入';
+
+  double get rawChangePercent {
     if (exitPrice == null || entryPrice == 0) return 0;
     return (exitPrice! - entryPrice) / entryPrice * 100;
   }
+
+  double get changePercent => isSellSignal ? -rawChangePercent : rawChangePercent;
 
   bool get isPending => exitPrice == null;
 
@@ -39,6 +51,8 @@ class PickRecord {
         'entryScore': entryScore,
         'recommendation': recommendation,
         'timingLabel': timingLabel,
+        'signalType': signalType,
+        'signalSource': signalSource,
         'exitPrice': exitPrice,
         'isWin': isWin,
       };
@@ -51,6 +65,8 @@ class PickRecord {
         entryScore: (json['entryScore'] as num?)?.toDouble() ?? 0,
         recommendation: json['recommendation'] as String? ?? '',
         timingLabel: json['timingLabel'] as String? ?? '',
+        signalType: json['signalType'] as String? ?? 'buy',
+        signalSource: json['signalSource'] as String? ?? 'legacy',
         exitPrice: json['exitPrice'] != null
             ? (json['exitPrice'] as num).toDouble()
             : null,

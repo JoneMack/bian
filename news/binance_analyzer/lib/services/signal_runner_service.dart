@@ -223,7 +223,7 @@ class SignalRunnerService {
       _binance.fetchWatchlistKlines(
         symbols: symbols,
         interval: '1d',
-        limit: 75,
+        limit: 90,
         forceRefresh: true,
       ),
       _binance.fetchWatchlistKlines(
@@ -243,6 +243,7 @@ class SignalRunnerService {
 
     final payload = {
       'generatedAt': generatedAt.toIso8601String(),
+      'analysisWindowDays': RecommendationEngine.historicalLookbackDays,
       'entrySignalPolicy': resolvedPolicy.toJson(),
       'backtest': engine.report.toJson(),
       'top3': engine.top3
@@ -260,6 +261,7 @@ class SignalRunnerService {
               })
           .toList(),
       'alerts': engine.entryAlerts.map((alert) => alert.toJson()).toList(),
+      'exitAlerts': engine.exitAlerts.map((alert) => alert.toJson()).toList(),
     };
 
     await _writeJsonFile(dailyReportPath, payload);
@@ -357,6 +359,81 @@ class SignalRunnerService {
     }
   }
 
+  Future<PushDeliveryResult> publishTestMessage({
+    PushProvider provider = PushProvider.auto,
+    String? feishuWebhookUrl,
+    String? server,
+    String? topic,
+    String? message,
+  }) async {
+    final resolvedProvider = _resolvePushProvider(
+      provider: provider,
+      feishuWebhookUrl: feishuWebhookUrl,
+      ntfyTopic: topic,
+    );
+
+    if (resolvedProvider == null) {
+      return PushDeliveryResult(
+        attempted: false,
+        sent: false,
+        provider: 'none',
+        status: 'skipped_unconfigured',
+        message: '未配置飞书 webhook 或 ntfy topic，无法发送测试推送',
+        recordedAt: DateTime.now(),
+      );
+    }
+
+    final body = (message == null || message.trim().isEmpty)
+        ? _buildTestPushBody(provider: resolvedProvider)
+        : message.trim();
+    final now = DateTime.now();
+
+    switch (resolvedProvider) {
+      case PushProvider.feishu:
+        final resolvedWebhook = feishuWebhookUrl?.trim() ?? '';
+        await _sendTextToFeishu(
+          webhookUrl: resolvedWebhook,
+          body: body,
+        );
+        return PushDeliveryResult(
+          attempted: true,
+          sent: true,
+          provider: 'feishu',
+          status: 'sent_test',
+          message: '已发送飞书测试消息',
+          recordedAt: now,
+        );
+      case PushProvider.ntfy:
+        final trimmedTopic = topic?.trim() ?? '';
+        final resolvedServer = (server == null || server.trim().isEmpty)
+            ? 'https://ntfy.sh'
+            : server.trim();
+        await _sendTextToNtfy(
+          server: resolvedServer,
+          topic: trimmedTopic,
+          body: body,
+          title: 'Binance Analyzer Test',
+        );
+        return PushDeliveryResult(
+          attempted: true,
+          sent: true,
+          provider: 'ntfy',
+          status: 'sent_test',
+          message: '已发送 ntfy 测试消息到 $resolvedServer/$trimmedTopic',
+          recordedAt: now,
+        );
+      case PushProvider.auto:
+        return PushDeliveryResult(
+          attempted: false,
+          sent: false,
+          provider: 'none',
+          status: 'skipped_unconfigured',
+          message: '未找到可用推送通道',
+          recordedAt: now,
+        );
+    }
+  }
+
   Future<PushDeliveryResult> publishToNtfy({
     required RecommendationEngineResult engine,
     required EntrySignalPolicy policy,
@@ -378,19 +455,23 @@ class SignalRunnerService {
       );
     }
 
-    final actionable = _pickActionableAlerts(engine);
-    if (actionable.isEmpty) {
+    final actionableEntry = _pickActionableAlerts(engine.entryAlerts);
+    final actionableExit = _pickActionableAlerts(engine.exitAlerts);
+    if (actionableEntry.isEmpty && actionableExit.isEmpty) {
       return PushDeliveryResult(
         attempted: false,
         sent: false,
         provider: 'ntfy',
         status: 'skipped_no_actionable',
-        message: '当前没有满足阈值的买点信号，不推送',
+        message: '当前没有满足阈值的买入或卖出信号，不推送',
         recordedAt: DateTime.now(),
       );
     }
 
-    final digest = _buildPushDigest(actionable);
+    final digest = _buildPushDigest(
+      entryAlerts: actionableEntry,
+      exitAlerts: actionableExit,
+    );
     final duplicate = await _checkDuplicatePush(
       digest: digest,
       dedupe: dedupe,
@@ -409,23 +490,15 @@ class SignalRunnerService {
     final body = _buildPushBody(
       engine: engine,
       policy: policy,
-      actionable: actionable,
+      actionableEntry: actionableEntry,
+      actionableExit: actionableExit,
     );
-
-    final uri = Uri.parse('$resolvedServer/$trimmedTopic');
-    final response = await _httpClient.post(
-      uri,
-      headers: {
-        HttpHeaders.contentTypeHeader: 'text/plain; charset=utf-8',
-        'Title': 'Binance Analyzer Signal',
-      },
+    await _sendTextToNtfy(
+      server: resolvedServer,
+      topic: trimmedTopic,
       body: body,
+      title: 'Binance Analyzer Signal',
     );
-    if (response.statusCode >= 400) {
-      throw HttpException(
-        'ntfy push failed: ${response.statusCode} ${response.body}',
-      );
-    }
 
     final now = DateTime.now();
     await _recordPushState(
@@ -467,19 +540,23 @@ class SignalRunnerService {
       );
     }
 
-    final actionable = _pickActionableAlerts(engine);
-    if (actionable.isEmpty) {
+    final actionableEntry = _pickActionableAlerts(engine.entryAlerts);
+    final actionableExit = _pickActionableAlerts(engine.exitAlerts);
+    if (actionableEntry.isEmpty && actionableExit.isEmpty) {
       return PushDeliveryResult(
         attempted: false,
         sent: false,
         provider: 'feishu',
         status: 'skipped_no_actionable',
-        message: '当前没有满足阈值的买点信号，不推送',
+        message: '当前没有满足阈值的买入或卖出信号，不推送',
         recordedAt: DateTime.now(),
       );
     }
 
-    final digest = _buildPushDigest(actionable);
+    final digest = _buildPushDigest(
+      entryAlerts: actionableEntry,
+      exitAlerts: actionableExit,
+    );
     final duplicate = await _checkDuplicatePush(
       digest: digest,
       dedupe: dedupe,
@@ -494,37 +571,13 @@ class SignalRunnerService {
     final body = _buildPushBody(
       engine: engine,
       policy: policy,
-      actionable: actionable,
+      actionableEntry: actionableEntry,
+      actionableExit: actionableExit,
     );
-    final response = await _httpClient.post(
-      Uri.parse(resolvedWebhook),
-      headers: {
-        HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
-      },
-      body: jsonEncode({
-        'msg_type': 'text',
-        'content': {
-          'text': body,
-        },
-      }),
+    await _sendTextToFeishu(
+      webhookUrl: resolvedWebhook,
+      body: body,
     );
-
-    if (response.statusCode >= 400) {
-      throw HttpException(
-        'feishu push failed: ${response.statusCode} ${response.body}',
-      );
-    }
-
-    if (response.body.isNotEmpty) {
-      final decoded = jsonDecode(response.body);
-      if (decoded is Map) {
-        final code = _asInt(decoded['code'] ?? decoded['StatusCode']);
-        if (code != 0) {
-          final msg = decoded['msg'] ?? decoded['StatusMessage'] ?? response.body;
-          throw HttpException('feishu push failed: $code $msg');
-        }
-      }
-    }
 
     final now = DateTime.now();
     await _recordPushState(
@@ -578,17 +631,19 @@ class SignalRunnerService {
     }
   }
 
-  List<EntryAlertSignal> _pickActionableAlerts(RecommendationEngineResult engine) {
-    return engine.entryAlerts.where((alert) => alert.shouldNotify).take(3).toList();
+  List<EntryAlertSignal> _pickActionableAlerts(List<EntryAlertSignal> alerts) {
+    return alerts.where((alert) => alert.shouldNotify).take(3).toList();
   }
 
   String _buildPushBody({
     required RecommendationEngineResult engine,
     required EntrySignalPolicy policy,
-    required List<EntryAlertSignal> actionable,
+    required List<EntryAlertSignal> actionableEntry,
+    required List<EntryAlertSignal> actionableExit,
   }) {
     final buffer = StringBuffer()
       ..writeln('Binance Analyzer 信号提醒')
+      ..writeln('分析窗口: ${RecommendationEngine.historicalLookbackDays} 天')
       ..writeln('轮动策略: ${engine.report.presetLabel}')
       ..writeln('提醒阈值: ${policy.summary}')
       ..writeln(
@@ -602,22 +657,53 @@ class SignalRunnerService {
             .map((coin) =>
                 '${coin.displayName} ${(coin.score * 100).round()}分 ${coin.timingLabel}')
             .join('\n'),
-      )
-      ..writeln('')
-      ..writeln('时机提醒:')
-      ..writeln(
-        actionable
-            .map((alert) =>
-                '${alert.symbol} ${alert.timingLabel} | ${(alert.totalScore * 100).round()}分 | ${alert.timingReason}')
-            .join('\n'),
       );
+
+    if (actionableEntry.isNotEmpty) {
+      buffer
+        ..writeln('')
+        ..writeln('买入信号:')
+        ..writeln(
+          actionableEntry
+              .map((alert) =>
+                  '${alert.symbol} ${alert.timingLabel} | ${(alert.totalScore * 100).round()}分 | ${alert.timingReason}')
+              .join('\n'),
+        );
+    }
+
+    if (actionableExit.isNotEmpty) {
+      buffer
+        ..writeln('')
+        ..writeln('卖出信号:')
+        ..writeln(
+          actionableExit
+              .map((alert) =>
+                  '${alert.symbol} ${alert.timingLabel} | ${(alert.entryScore * 100).round()}分 | ${alert.timingReason}')
+              .join('\n'),
+        );
+    }
+
     return buffer.toString();
   }
 
-  String _buildPushDigest(List<EntryAlertSignal> alerts) {
-    return alerts
-        .map((alert) => '${alert.symbol}:${alert.timingLabel}')
-        .join('|');
+  String _buildTestPushBody({required PushProvider provider}) {
+    return (StringBuffer()
+      ..writeln('Binance Analyzer 测试推送')
+      ..writeln('时间: ${DateTime.now().toIso8601String()}')
+      ..writeln('通道: ${provider.name}')
+      ..writeln('说明: 这是一条服务器连通性测试消息'))
+        .toString();
+  }
+
+  String _buildPushDigest({
+    required List<EntryAlertSignal> entryAlerts,
+    required List<EntryAlertSignal> exitAlerts,
+  }) {
+    final parts = <String>[
+      ...entryAlerts.map((alert) => 'buy:${alert.symbol}:${alert.timingLabel}'),
+      ...exitAlerts.map((alert) => 'sell:${alert.symbol}:${alert.timingLabel}'),
+    ];
+    return parts.join('|');
   }
 
   Future<PushDeliveryResult?> _checkDuplicatePush({
@@ -676,6 +762,61 @@ class SignalRunnerService {
     if (value is num) return value.toInt();
     if (value == null) return 0;
     return int.tryParse(value.toString()) ?? 0;
+  }
+
+  Future<void> _sendTextToNtfy({
+    required String server,
+    required String topic,
+    required String body,
+    required String title,
+  }) async {
+    final response = await _httpClient.post(
+      Uri.parse('$server/$topic'),
+      headers: {
+        HttpHeaders.contentTypeHeader: 'text/plain; charset=utf-8',
+        'Title': title,
+      },
+      body: body,
+    );
+    if (response.statusCode >= 400) {
+      throw HttpException(
+        'ntfy push failed: ${response.statusCode} ${response.body}',
+      );
+    }
+  }
+
+  Future<void> _sendTextToFeishu({
+    required String webhookUrl,
+    required String body,
+  }) async {
+    final response = await _httpClient.post(
+      Uri.parse(webhookUrl),
+      headers: {
+        HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+      },
+      body: jsonEncode({
+        'msg_type': 'text',
+        'content': {
+          'text': body,
+        },
+      }),
+    );
+
+    if (response.statusCode >= 400) {
+      throw HttpException(
+        'feishu push failed: ${response.statusCode} ${response.body}',
+      );
+    }
+
+    if (response.body.isEmpty) return;
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map) return;
+
+    final code = _asInt(decoded['code'] ?? decoded['StatusCode']);
+    if (code == 0) return;
+
+    final msg = decoded['msg'] ?? decoded['StatusMessage'] ?? response.body;
+    throw HttpException('feishu push failed: $code $msg');
   }
 
   Future<Map<String, dynamic>> _readJsonFile(String path) async {

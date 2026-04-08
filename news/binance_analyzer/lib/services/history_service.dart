@@ -14,13 +14,27 @@ class HistoryService {
 
   // ── 读取历史 ──────────────────────────────────────
   Future<List<DailyRecommendation>> loadHistory() async {
+    final list = await _loadAllHistory();
+    final filtered = list
+        .map(
+          (day) => DailyRecommendation(
+            date: day.date,
+            picks: day.picks.where((pick) => pick.isFeishuSignal).toList(),
+          ),
+        )
+        .where((day) => day.picks.isNotEmpty)
+        .toList();
+    filtered.sort((a, b) => b.date.compareTo(a.date));
+    return filtered.take(30).toList();
+  }
+
+  Future<List<DailyRecommendation>> _loadAllHistory() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_key);
     if (raw == null || raw.isEmpty) return [];
     final list = DailyRecommendation.decodeList(raw);
-    // 最近30天
     list.sort((a, b) => b.date.compareTo(a.date));
-    return list.take(30).toList();
+    return list;
   }
 
   // ── 保存今日推荐 ──────────────────────────────────
@@ -56,10 +70,53 @@ class HistoryService {
     await prefs.setString(_key, DailyRecommendation.encodeList(history));
   }
 
+  Future<void> saveTodayFeishuSignals({
+    required List<EntryAlertSignal> entryAlerts,
+    required List<EntryAlertSignal> exitAlerts,
+    required List<CoinData> marketCoins,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    var history = await _loadAllHistory();
+    final today = _dateOnly(DateTime.now());
+    final picks = _buildFeishuSignalPicks(
+      entryAlerts: entryAlerts,
+      exitAlerts: exitAlerts,
+      marketCoins: marketCoins,
+      date: today,
+    );
+    if (picks.isEmpty) return;
+
+    final index = history.indexWhere((day) => _dateOnly(day.date) == today);
+    if (index == -1) {
+      history.insert(0, DailyRecommendation(date: today, picks: picks));
+    } else {
+      final merged = <String, PickRecord>{
+        for (final pick in history[index].picks) _pickKey(pick): pick,
+      };
+      for (final pick in picks) {
+        merged[_pickKey(pick)] = pick;
+      }
+      history[index] = DailyRecommendation(
+        date: history[index].date,
+        picks: merged.values.toList()
+          ..sort((a, b) {
+            if (a.signalType != b.signalType) {
+              return a.signalType == 'buy' ? -1 : 1;
+            }
+            return a.symbol.compareTo(b.symbol);
+          }),
+      );
+    }
+
+    history.sort((a, b) => b.date.compareTo(a.date));
+    if (history.length > 30) history = history.sublist(0, 30);
+    await prefs.setString(_key, DailyRecommendation.encodeList(history));
+  }
+
   // ── 用最新价格结算昨天的推荐 ──────────────────────
   Future<void> settleYesterday(List<CoinData> latestCoins) async {
     final prefs = await SharedPreferences.getInstance();
-    var history = await loadHistory();
+    final history = await _loadAllHistory();
 
     final yesterday =
         _dateOnly(DateTime.now().subtract(const Duration(days: 1)));
@@ -79,7 +136,9 @@ class HistoryService {
         if (coin.displayName != pick.symbol) continue;
 
         pick.exitPrice = coin.lastPrice;
-        pick.isWin = coin.lastPrice > pick.entryPrice;
+        pick.isWin = pick.isSellSignal
+            ? coin.lastPrice < pick.entryPrice
+            : coin.lastPrice > pick.entryPrice;
         changed = true;
       }
     }
@@ -102,6 +161,10 @@ class HistoryService {
     int highConfidenceWins = 0;
     int actionableTotal = 0;
     int actionableWins = 0;
+    int buyTotal = 0;
+    int buyWins = 0;
+    int sellTotal = 0;
+    int sellWins = 0;
     final bySymbol = <String, List<double>>{};
     final dayReturns = <double>[];
 
@@ -121,6 +184,13 @@ class HistoryService {
 
         if (pick.isWin!) {
           wins++;
+        }
+        if (pick.isSellSignal) {
+          sellTotal++;
+          if (pick.isWin == true) sellWins++;
+        } else {
+          buyTotal++;
+          if (pick.isWin == true) buyWins++;
         }
         if (pick.score >= 0.62) {
           highConfidenceTotal++;
@@ -181,6 +251,12 @@ class HistoryService {
       'actionableTotal': actionableTotal,
       'actionableWins': actionableWins,
       'actionableWinRate': actionableWinRate,
+      'buyTotal': buyTotal,
+      'buyWins': buyWins,
+      'buyWinRate': buyTotal > 0 ? buyWins / buyTotal : 0.0,
+      'sellTotal': sellTotal,
+      'sellWins': sellWins,
+      'sellWinRate': sellTotal > 0 ? sellWins / sellTotal : 0.0,
       'replayReport': replayReport,
     };
   }
@@ -219,4 +295,52 @@ class HistoryService {
   }
 
   static DateTime _dateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
+
+  String _pickKey(PickRecord pick) => '${pick.signalSource}:${pick.signalType}:${pick.symbol}';
+
+  List<PickRecord> _buildFeishuSignalPicks({
+    required List<EntryAlertSignal> entryAlerts,
+    required List<EntryAlertSignal> exitAlerts,
+    required List<CoinData> marketCoins,
+    required DateTime date,
+  }) {
+    final picks = <PickRecord>[];
+    final bySymbol = {for (final coin in marketCoins) coin.displayName: coin};
+
+    for (final alert in entryAlerts.where((item) => item.shouldNotify).take(3)) {
+      final coin = bySymbol[alert.symbol];
+      picks.add(
+        PickRecord(
+          symbol: alert.symbol,
+          entryPrice: alert.currentPrice,
+          date: date,
+          score: alert.totalScore,
+          entryScore: alert.entryScore,
+          recommendation: coin?.recommendation ?? '飞书买入信号',
+          timingLabel: alert.timingLabel,
+          signalType: 'buy',
+          signalSource: 'feishu',
+        ),
+      );
+    }
+
+    for (final alert in exitAlerts.where((item) => item.shouldNotify).take(3)) {
+      final coin = bySymbol[alert.symbol];
+      picks.add(
+        PickRecord(
+          symbol: alert.symbol,
+          entryPrice: alert.currentPrice,
+          date: date,
+          score: alert.totalScore,
+          entryScore: alert.entryScore,
+          recommendation: coin?.recommendation ?? '飞书卖出信号',
+          timingLabel: alert.timingLabel,
+          signalType: 'sell',
+          signalSource: 'feishu',
+        ),
+      );
+    }
+
+    return picks;
+  }
 }

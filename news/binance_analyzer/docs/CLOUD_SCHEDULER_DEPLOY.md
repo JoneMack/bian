@@ -69,7 +69,10 @@ DEDUPE_PUSH=true
 - `GET /market-snapshot?symbols=FETUSDT,TONUSDT`
 - `GET /market-snapshot?symbols=FETUSDT,TONUSDT&refresh=1`
 - `GET /run?token=...`
+- `GET /push-test?token=...`
 - `POST /run`，Header:
+  `Authorization: Bearer <RUNNER_TOKEN>`
+- `POST /push-test`，Header:
   `Authorization: Bearer <RUNNER_TOKEN>`
 
 ### `market-snapshot` 是做什么的
@@ -134,6 +137,18 @@ curl http://localhost:8080/health
 
 ```bash
 curl "http://localhost:8080/run?token=your-secret-token"
+```
+
+测试飞书/ntfy 推送链路：
+
+```bash
+curl "http://localhost:8080/push-test?token=your-secret-token"
+```
+
+如果要强制只测飞书：
+
+```bash
+curl "http://localhost:8080/push-test?token=your-secret-token&provider=feishu"
 ```
 
 ## 4. 推荐环境变量

@@ -32,6 +32,8 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+.home/
+*.tar.gz
 
 # Symbolication related
 app.*.symbols

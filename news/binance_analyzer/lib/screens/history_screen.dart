@@ -43,7 +43,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
       appBar: AppBar(
         backgroundColor: AppTheme.binanceDark,
         elevation: 0,
-        title: const Text('历史准确率',
+        title: const Text('飞书信号统计',
             style: TextStyle(
                 color: AppTheme.textPrimary,
                 fontSize: 18,
@@ -93,14 +93,14 @@ class _HistoryScreenState extends State<HistoryScreen> {
               Icon(Icons.history_rounded,
                   color: AppTheme.textSecondary, size: 60),
               SizedBox(height: 16),
-              Text('暂无历史记录',
+              Text('暂无飞书信号记录',
                   style: TextStyle(
                       color: AppTheme.textPrimary,
                       fontSize: 18,
                       fontWeight: FontWeight.bold)),
               SizedBox(height: 8),
               Text(
-                '每天查看「今日精选」后\n系统自动记录推荐并追踪结果',
+                '只统计飞书实际口径的买入/卖出信号\n并自动追踪次日结果',
                 style: TextStyle(
                     color: AppTheme.textSecondary, fontSize: 14),
                 textAlign: TextAlign.center,
@@ -127,7 +127,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
           decoration: BoxDecoration(
               color: AppTheme.cardDark,
               borderRadius: BorderRadius.circular(14)),
-          child: const Text('等待次日结算后显示准确率统计',
+          child: const Text('等待飞书信号产生并在次日结算后显示统计',
               style: TextStyle(
                   color: AppTheme.textSecondary, fontSize: 13),
               textAlign: TextAlign.center),
@@ -153,7 +153,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('📈 整体统计',
+            const Text('📈 飞书买卖信号统计',
                 style: TextStyle(
                     color: AppTheme.textPrimary,
                     fontSize: 14,
@@ -176,7 +176,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                       avgReturn >= 0 ? AppTheme.green : AppTheme.red,
                 ),
                 _BigStat(
-                    label: '累计推荐',
+                    label: '累计信号',
                     value: '$total 次',
                     color: AppTheme.textSecondary),
                 _BigStat(
@@ -210,6 +210,22 @@ class _HistoryScreenState extends State<HistoryScreen> {
                             ? '⚠️ 准确率一般'
                             : '❌ 准确率偏低，算法待优化',
                     style: TextStyle(color: rateColor, fontSize: 11)),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                _MiniStatLine(
+                  label: '买入',
+                  value:
+                      '${_stats['buyWins'] ?? 0}/${_stats['buyTotal'] ?? 0} | ${((_stats['buyWinRate'] as double? ?? 0) * 100).toStringAsFixed(0)}%',
+                ),
+                _MiniStatLine(
+                  label: '卖出',
+                  value:
+                      '${_stats['sellWins'] ?? 0}/${_stats['sellTotal'] ?? 0} | ${((_stats['sellWinRate'] as double? ?? 0) * 100).toStringAsFixed(0)}%',
+                ),
               ],
             ),
           ],
@@ -312,7 +328,7 @@ class _DayCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 10),
-            // 每个推荐
+            // 每个飞书信号
             ...day.picks.map((p) => _PickRow(pick: p)),
           ],
         ),
@@ -357,6 +373,23 @@ class _PickRow extends StatelessWidget {
                   color: AppTheme.textPrimary,
                   fontSize: 13,
                   fontWeight: FontWeight.bold)),
+          const SizedBox(width: 6),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: (pick.isSellSignal ? AppTheme.red : AppTheme.green)
+                  .withAlpha(30),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              pick.signalTypeLabel,
+              style: TextStyle(
+                color: pick.isSellSignal ? AppTheme.red : AppTheme.green,
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
           const SizedBox(width: 6),
           Text(
             '@${_fmt(pick.entryPrice)}',
@@ -408,6 +441,27 @@ class _BigStat extends StatelessWidget {
             style: const TextStyle(
                 color: AppTheme.textSecondary, fontSize: 11)),
       ],
+    );
+  }
+}
+
+class _MiniStatLine extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _MiniStatLine({
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      '$label: $value',
+      style: const TextStyle(
+        color: AppTheme.textSecondary,
+        fontSize: 11,
+      ),
     );
   }
 }

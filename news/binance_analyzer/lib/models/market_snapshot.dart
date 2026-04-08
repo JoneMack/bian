@@ -9,6 +9,7 @@ class MarketSnapshot {
   final DateTime updatedAt;
   final StrategyBacktestReport? engineReport;
   final List<EntryAlertSignal> entryAlerts;
+  final List<EntryAlertSignal> exitAlerts;
   final List<String> watchlistSymbols;
 
   const MarketSnapshot({
@@ -18,6 +19,7 @@ class MarketSnapshot {
     required this.watchlistSymbols,
     this.engineReport,
     this.entryAlerts = const [],
+    this.exitAlerts = const [],
   });
 
   Map<String, dynamic> toJson() => {
@@ -26,6 +28,7 @@ class MarketSnapshot {
         'updatedAt': updatedAt.toIso8601String(),
         'engineReport': engineReport?.toJson(),
         'entryAlerts': entryAlerts.map((item) => item.toJson()).toList(),
+        'exitAlerts': exitAlerts.map((item) => item.toJson()).toList(),
         'watchlistSymbols': watchlistSymbols,
       };
 
@@ -45,6 +48,9 @@ class MarketSnapshot {
             )
           : null,
       entryAlerts: (json['entryAlerts'] as List<dynamic>? ?? const [])
+          .map((item) => EntryAlertSignal.fromJson(item as Map<String, dynamic>))
+          .toList(),
+      exitAlerts: (json['exitAlerts'] as List<dynamic>? ?? const [])
           .map((item) => EntryAlertSignal.fromJson(item as Map<String, dynamic>))
           .toList(),
       watchlistSymbols: (json['watchlistSymbols'] as List<dynamic>? ?? const [])

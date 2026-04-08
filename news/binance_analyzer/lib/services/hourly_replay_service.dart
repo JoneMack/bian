@@ -7,8 +7,9 @@ import 'recommendation_engine.dart';
 
 class HourlyReplayService {
   static const double targetWinRate = 0.80;
-  static const Duration replayWindow = Duration(days: 30);
-  static const Duration validationWindow = Duration(days: 14);
+  static const Duration replayWindow =
+      Duration(days: RecommendationEngine.historicalLookbackDays);
+  static const Duration validationWindow = Duration(days: 15);
 
   Future<HourlyReplayReport> generateReport({
     required Map<String, List<Kline>> dailyHistory,
@@ -25,7 +26,8 @@ class HourlyReplayService {
     final eligibleSymbols = normalizedHourly.keys
         .where(
           (symbol) =>
-              (normalizedDaily[symbol]?.length ?? 0) >= 35 &&
+              (normalizedDaily[symbol]?.length ?? 0) >=
+                  RecommendationEngine.minimumDailyBars &&
               (normalizedHourly[symbol]?.length ?? 0) >= 120,
         )
         .toList()
@@ -54,7 +56,7 @@ class HourlyReplayService {
         targetMet: false,
         optimizedPolicy: EntrySignalPolicy.defaultPolicy,
         notes:
-            '可用于小时回放的币种不足，当前只有 ${eligibleSymbols.length} 个标的满足最近 30 天日线和 120 小时样本要求。',
+            '可用于小时回放的币种不足，当前只有 ${eligibleSymbols.length} 个标的满足最近 45 天日线和 120 小时样本要求。',
         recentAlerts: const [],
       );
     }
@@ -202,7 +204,7 @@ class HourlyReplayService {
       final recent72 = hourlyBars.sublist(index - 71, index + 1);
       final dailyBars =
           _dailyClosedBefore(dailyHistory[symbol] ?? const [], at);
-      if (dailyBars.length < 35) continue;
+      if (dailyBars.length < RecommendationEngine.minimumDailyBars) continue;
 
       currentCoins.add(_snapshotCoin(symbol, recent24));
       dailySlices[symbol] = dailyBars;

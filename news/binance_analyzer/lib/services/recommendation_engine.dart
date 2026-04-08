@@ -9,16 +9,21 @@ class RecommendationEngineResult {
   final List<CoinData> top3;
   final StrategyBacktestReport report;
   final List<EntryAlertSignal> entryAlerts;
+  final List<EntryAlertSignal> exitAlerts;
 
   const RecommendationEngineResult({
     required this.rankedCoins,
     required this.top3,
     required this.report,
     required this.entryAlerts,
+    required this.exitAlerts,
   });
 }
 
 class RecommendationEngine {
+  static const int historicalLookbackDays = 45;
+  static const int minimumDailyBars = historicalLookbackDays + 7;
+
   static const List<_StrategyPreset> _presets = [
     _StrategyPreset(
       id: 'balanced',
@@ -88,13 +93,14 @@ class RecommendationEngine {
           generatedAt: DateTime.now(),
         ),
         entryAlerts: const [],
+        exitAlerts: const [],
       );
     }
 
     final dailyClosed = <String, List<Kline>>{};
     for (final coin in currentCoins) {
       final bars = _closedBars(dailyHistory[coin.symbol] ?? const []);
-      if (bars.length >= 35) {
+      if (bars.length >= minimumDailyBars) {
         dailyClosed[coin.symbol] = bars;
       }
     }
@@ -107,6 +113,7 @@ class RecommendationEngine {
       hourlyHistory,
       policy: policy,
     );
+    final exits = _buildExitSignals(scored, hourlyHistory);
 
     scored.sort((a, b) {
       final primary = b.score.compareTo(a.score);
@@ -120,6 +127,7 @@ class RecommendationEngine {
       top3: top3,
       report: preset.report,
       entryAlerts: alerts,
+      exitAlerts: exits,
     );
   }
 
@@ -172,7 +180,7 @@ class RecommendationEngine {
     _StrategyPreset preset,
   ) {
     final symbols = history.entries
-        .where((entry) => entry.value.length >= 36)
+        .where((entry) => entry.value.length >= minimumDailyBars)
         .map((entry) => entry.key)
         .toList();
 
@@ -182,7 +190,7 @@ class RecommendationEngine {
 
     final minLength =
         symbols.map((symbol) => history[symbol]!.length).reduce(min);
-    const startIndex = 30;
+    const startIndex = historicalLookbackDays;
     final endIndex = minLength - 2;
 
     if (endIndex <= startIndex) {
@@ -270,7 +278,7 @@ class RecommendationEngine {
     final profiles = <String, _HistoricalProfile>{};
     for (final coin in currentCoins) {
       final bars = dailyClosed[coin.symbol];
-      if (bars == null || bars.length < 31) continue;
+      if (bars == null || bars.length < historicalLookbackDays + 1) continue;
 
       final profile = _buildHistoricalProfile(
         coin.symbol,
@@ -310,7 +318,7 @@ class RecommendationEngine {
         coin.score = 0.28;
         coin.level = RecommendationLevel.avoid;
         coin.recommendation = '观察数据';
-        coin.reason = '30天历史数据不足，暂时只保留观察状态';
+        coin.reason = '45天历史数据不足，暂时只保留观察状态';
         continue;
       }
 
@@ -474,6 +482,29 @@ class RecommendationEngine {
     return alerts;
   }
 
+  static List<EntryAlertSignal> _buildExitSignals(
+    List<CoinData> scoredCoins,
+    Map<String, List<Kline>> hourlyHistory,
+  ) {
+    final alerts = <EntryAlertSignal>[];
+
+    for (final coin in scoredCoins) {
+      final bars = _closedBars(hourlyHistory[coin.symbol] ?? const []);
+      alerts.add(_buildExitSignal(coin, bars));
+    }
+
+    alerts.sort((a, b) {
+      if (a.shouldNotify != b.shouldNotify) {
+        return b.shouldNotify ? 1 : -1;
+      }
+      final byExit = b.entryScore.compareTo(a.entryScore);
+      if (byExit != 0) return byExit;
+      return b.totalScore.compareTo(a.totalScore);
+    });
+
+    return alerts;
+  }
+
   static EntryAlertSignal _buildTimingSignal(
     CoinData coin,
     List<Kline> bars, {
@@ -570,6 +601,75 @@ class RecommendationEngine {
     return signal.copyWith(shouldNotify: policy.matches(signal));
   }
 
+  static EntryAlertSignal _buildExitSignal(
+    CoinData coin,
+    List<Kline> bars,
+  ) {
+    if (bars.length < 24) {
+      return EntryAlertSignal(
+        symbol: coin.displayName,
+        timingLabel: '继续持有',
+        timingReason: '小时级样本不足，先继续观察。',
+        currentPrice: coin.lastPrice,
+        dayChangePercent: coin.priceChangePercent,
+        totalScore: coin.score,
+        entryScore: 0,
+        volumeRatio: 0,
+        breakoutDistance: 0,
+        pullbackPercent: 0,
+        shouldNotify: false,
+      );
+    }
+
+    final closes = bars.map((bar) => bar.close).toList();
+    final ma8 = _average(closes.sublist(max(0, closes.length - 8)));
+    final ma21 = _average(closes.sublist(max(0, closes.length - 21)));
+    final recentHigh18 = bars
+        .sublist(max(0, bars.length - 19), bars.length - 1)
+        .map((bar) => bar.high)
+        .reduce(max);
+    final lastClose = bars.last.close;
+    final drawdown = recentHigh18 > 0
+        ? ((recentHigh18 - lastClose) / recentHigh18) * 100
+        : 0.0;
+    final maGapPercent =
+        ma21 > 0 ? ((lastClose - ma21) / ma21) * 100 : 0.0;
+    final weaknessScore = (_clamp01((drawdown - 1.4) / 4.4) * 0.35 +
+            _clamp01((-maGapPercent + 0.6) / 4.4) * 0.25 +
+            _clamp01((-coin.priceChangePercent - 0.8) / 5.2) * 0.20 +
+            _clamp01((coin.thirtyDayChange - 8) / 26) * 0.20)
+        .clamp(0.0, 1.0);
+
+    final trendBroken = lastClose < ma21 && ma8 < ma21;
+    final label = trendBroken && drawdown >= 3.2
+        ? coin.thirtyDayChange >= 12
+            ? '止盈减仓'
+            : '止损离场'
+        : drawdown >= 6 || coin.priceChangePercent <= -6
+            ? '止损离场'
+            : weaknessScore >= 0.58 && coin.thirtyDayChange >= 10
+                ? '观察止盈'
+                : '继续持有';
+
+    final reason =
+        '1h MA8 ${ma8 < ma21 ? '跌破' : '仍高于'} MA21；距18h高点回撤 ${drawdown.toStringAsFixed(2)}%；相对MA21 ${maGapPercent >= 0 ? '+' : ''}${maGapPercent.toStringAsFixed(2)}%';
+
+    return EntryAlertSignal(
+      symbol: coin.displayName,
+      timingLabel: label,
+      timingReason: reason,
+      currentPrice: coin.lastPrice,
+      dayChangePercent: coin.priceChangePercent,
+      totalScore: coin.score,
+      entryScore: weaknessScore,
+      volumeRatio: 0,
+      breakoutDistance: maGapPercent,
+      pullbackPercent: drawdown,
+      shouldNotify:
+          (label == '止盈减仓' || label == '止损离场') && weaknessScore >= 0.62,
+    );
+  }
+
   static _HistoricalProfile? _buildHistoricalProfile(
     String symbol,
     List<Kline> bars,
@@ -579,15 +679,18 @@ class RecommendationEngine {
     double? liveQuoteVolume,
     int? liveTradeCount,
   }) {
-    if (endIndex < 30 || bars.length <= endIndex) return null;
+    if (endIndex < historicalLookbackDays || bars.length <= endIndex) {
+      return null;
+    }
 
-    final window30 = bars.sublist(endIndex - 30, endIndex + 1);
+    final window30 =
+        bars.sublist(endIndex - historicalLookbackDays, endIndex + 1);
     final window7 = bars.sublist(endIndex - 7, endIndex + 1);
     final latest = bars[endIndex];
     final prev = bars[endIndex - 1];
 
     final returns30 = <double>[];
-    for (var i = endIndex - 29; i <= endIndex; i++) {
+    for (var i = endIndex - (historicalLookbackDays - 1); i <= endIndex; i++) {
       final close = bars[i].close;
       final prevClose = bars[i - 1].close;
       if (prevClose <= 0) continue;
@@ -676,7 +779,7 @@ class RecommendationEngine {
     required _StrategyPreset preset,
   }) {
     final parts = <String>[
-      '30天${profile.thirtyDayReturn >= 0 ? '+' : ''}${(profile.thirtyDayReturn * 100).toStringAsFixed(1)}%',
+      '45天${profile.thirtyDayReturn >= 0 ? '+' : ''}${(profile.thirtyDayReturn * 100).toStringAsFixed(1)}%',
       '近7天${profile.sevenDayReturn >= 0 ? '+' : ''}${(profile.sevenDayReturn * 100).toStringAsFixed(1)}%',
       '距上次大阳线 ${profile.daysSinceSurge} 天',
     ];
