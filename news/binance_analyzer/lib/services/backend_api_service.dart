@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../models/market_snapshot.dart';
+import '../models/news_item.dart';
 import 'binance_service.dart';
 
 class BackendApiService {
@@ -68,6 +69,55 @@ class BackendApiService {
     }
 
     return MarketSnapshot.fromJson(decoded);
+  }
+
+  Future<List<NewsItem>> fetchNewsFeed({
+    int limit = 40,
+    List<String> categories = const [],
+    bool forceRefresh = false,
+  }) async {
+    final resolvedBaseUrl = this.resolvedBaseUrl;
+    if (resolvedBaseUrl == null) {
+      throw StateError('BACKEND_BASE_URL 未配置');
+    }
+
+    final normalizedCategories = categories
+        .map((item) => item.trim().toUpperCase())
+        .where((item) => item.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+
+    final queryParameters = <String, String>{
+      'limit': '$limit',
+    };
+    if (normalizedCategories.isNotEmpty) {
+      queryParameters['categories'] = normalizedCategories.join(',');
+    }
+    if (forceRefresh) {
+      queryParameters['refresh'] = '1';
+    }
+
+    final uri = Uri.parse('$resolvedBaseUrl/news')
+        .replace(queryParameters: queryParameters);
+    final response =
+        await _client.get(uri).timeout(const Duration(seconds: 25));
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        '后台资讯请求失败(${response.statusCode})：${response.body}',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception('后台返回的 news 格式无效');
+    }
+
+    final items = (decoded['items'] as List<dynamic>? ?? const [])
+        .map((item) => NewsItem.fromJson(item as Map<String, dynamic>))
+        .toList();
+    return items;
   }
 
   static String? _normalizeBaseUrl(String? value) {

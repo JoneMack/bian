@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:http/http.dart' as http;
 import '../models/coin_data.dart';
 
@@ -223,7 +224,7 @@ class BinanceService {
   }
 
   Future<List<String>> fetchTradableUsdtSymbols({
-    int limit = 240,
+    int? limit,
   }) async {
     await _findWorkingHost();
 
@@ -231,6 +232,29 @@ class BinanceService {
       (host) => _fetchTradableUsdtSymbolsOnHost(host, limit: limit),
       debugLabel: 'exchangeInfo',
     );
+  }
+
+  Future<List<CoinData>> fetchAllTickers() async {
+    await _findWorkingHost();
+
+    return _withHostFallback<List<CoinData>>(
+      (host) => _fetchAllTickersOnHost(host),
+      debugLabel: 'ticker/all',
+    );
+  }
+
+  Future<List<CoinData>> fetchTradableUsdtTickers({
+    int? limit,
+  }) async {
+    final tradableSymbols = await fetchTradableUsdtSymbols(limit: limit);
+    final tradableSet = tradableSymbols.toSet();
+    final tickers = await fetchAllTickers();
+
+    final filtered = tickers
+        .where((coin) => tradableSet.contains(coin.symbol))
+        .toList()
+      ..sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
+    return filtered;
   }
 
   Future<CoinData?> _fetchOne(String host, String symbol) async {
@@ -290,11 +314,12 @@ class BinanceService {
     Duration? ttl,
     bool forceRefresh = false,
     bool allowFailures = true,
+    int chunkSize = 6,
   }) async {
     final targets = symbols ?? watchlistSymbols;
     final result = <String, List<Kline>>{};
 
-    for (final chunk in _chunk(targets, 6)) {
+    for (final chunk in _chunk(targets, max(1, chunkSize))) {
       final bars = await Future.wait(
         chunk.map((symbol) async {
           try {
@@ -357,7 +382,7 @@ class BinanceService {
 
   Future<List<String>?> _fetchTradableUsdtSymbolsOnHost(
     String host, {
-    required int limit,
+    required int? limit,
   }) async {
     final resp = await http
         .get(Uri.parse('$host/api/v3/exchangeInfo'))
@@ -379,7 +404,33 @@ class BinanceService {
       ..sort();
 
     if (symbols.isEmpty) return null;
+    if (limit == null || limit <= 0) {
+      return symbols;
+    }
     return symbols.take(limit).toList();
+  }
+
+  Future<List<CoinData>?> _fetchAllTickersOnHost(String host) async {
+    final resp = await http
+        .get(Uri.parse('$host/api/v3/ticker/24hr'))
+        .timeout(const Duration(seconds: 20));
+    if (resp.statusCode != 200) return null;
+
+    final data = jsonDecode(resp.body);
+    if (data is! List) return null;
+
+    final coins = data
+        .map((item) {
+          try {
+            return CoinData.fromJson(item as Map<String, dynamic>);
+          } catch (_) {
+            return null;
+          }
+        })
+        .whereType<CoinData>()
+        .toList();
+
+    return coins.isEmpty ? null : coins;
   }
 
   Duration _defaultCacheTtl(String interval) {

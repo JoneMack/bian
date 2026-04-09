@@ -119,4 +119,58 @@ void main() {
     expect(snapshot.entryAlerts.single.shouldNotify, isTrue);
     expect(snapshot.engineReport?.presetLabel, '轮动优先');
   });
+
+  test('fetches remote news feed with translated content', () async {
+    final client = MockClient((request) async {
+      expect(request.url.toString(), contains('/news'));
+      expect(request.url.queryParameters['limit'], '20');
+      expect(request.url.queryParameters['categories'], 'BTC,ETH');
+      expect(request.url.queryParameters['refresh'], '1');
+
+      return http.Response(
+        '''
+        {
+          "items": [
+            {
+              "id": "story-1",
+              "title": "Bitcoin traders watch ETF flows",
+              "body": "ETF demand lifted sentiment across majors.",
+              "translatedTitle": "比特币交易员关注 ETF 资金流",
+              "translatedBody": "ETF 需求回升，带动主流币情绪改善。",
+              "url": "https://example.com/story-1",
+              "source": "Cointelegraph",
+              "imageUrl": "https://example.com/story-1.png",
+              "publishedAt": "2026-04-08T12:00:00.000Z",
+              "tags": ["BTC", "ETF"],
+              "isHot": true
+            }
+          ],
+          "updatedAt": "2026-04-08T12:01:00.000Z"
+        }
+        ''',
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final service = BackendApiService(
+      client: client,
+      baseUrlOverride: 'https://example.com/api',
+    );
+
+    final items = await service.fetchNewsFeed(
+      limit: 20,
+      categories: const ['eth', 'btc'],
+      forceRefresh: true,
+    );
+
+    expect(items, hasLength(1));
+    expect(items.single.title, 'Bitcoin traders watch ETF flows');
+    expect(items.single.translatedTitle, '比特币交易员关注 ETF 资金流');
+    expect(items.single.translatedBody, 'ETF 需求回升，带动主流币情绪改善。');
+    expect(items.single.displayTitle, '比特币交易员关注 ETF 资金流');
+    expect(items.single.source, 'Cointelegraph');
+    expect(items.single.tags, ['BTC', 'ETF']);
+    expect(items.single.isHot, isTrue);
+  });
 }

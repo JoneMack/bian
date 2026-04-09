@@ -11,7 +11,8 @@ import 'package:http/testing.dart';
 
 void main() {
   test('auto provider prefers feishu webhook when configured', () async {
-    final tempDir = await Directory.systemTemp.createTemp('signal-runner-test-');
+    final tempDir =
+        await Directory.systemTemp.createTemp('signal-runner-test-');
     addTearDown(() => tempDir.delete(recursive: true));
 
     final client = MockClient((request) async {
@@ -21,7 +22,8 @@ void main() {
       );
       final payload = jsonDecode(request.body) as Map<String, dynamic>;
       expect(payload['msg_type'], 'text');
-      expect((payload['content'] as Map<String, dynamic>)['text'], contains('FET'));
+      expect((payload['content'] as Map<String, dynamic>)['text'],
+          contains('FET'));
       expect(
         (payload['content'] as Map<String, dynamic>)['text'],
         contains('可入场'),
@@ -47,7 +49,8 @@ void main() {
   });
 
   test('dedupe is isolated per provider', () async {
-    final tempDir = await Directory.systemTemp.createTemp('signal-runner-test-');
+    final tempDir =
+        await Directory.systemTemp.createTemp('signal-runner-test-');
     addTearDown(() => tempDir.delete(recursive: true));
 
     final client = MockClient((request) async {
@@ -117,13 +120,16 @@ void main() {
     expect(result.status, 'sent_test');
   });
 
-  test('publishSignal also sends when only sell signals are actionable', () async {
-    final tempDir = await Directory.systemTemp.createTemp('signal-runner-test-');
+  test('publishSignal also sends when only sell signals are actionable',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('signal-runner-test-');
     addTearDown(() => tempDir.delete(recursive: true));
 
     final client = MockClient((request) async {
       final payload = jsonDecode(request.body) as Map<String, dynamic>;
-      final text = (payload['content'] as Map<String, dynamic>)['text'] as String;
+      final text =
+          (payload['content'] as Map<String, dynamic>)['text'] as String;
       expect(text, contains('卖出信号'));
       expect(text, contains('止盈减仓'));
       return http.Response('{"code":0,"msg":"success"}', 200);
@@ -146,6 +152,74 @@ void main() {
     expect(result.sent, isTrue);
     expect(result.provider, 'feishu');
     expect(result.status, 'sent');
+  });
+
+  test(
+      'refreshStartupPredictionLog settles matured predictions and updates accuracy',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('signal-runner-test-');
+    addTearDown(() => tempDir.delete(recursive: true));
+
+    final logPath = '${tempDir.path}/startup_buy_log.json';
+    final recordedAt =
+        DateTime.now().subtract(const Duration(hours: 25)).toIso8601String();
+    await File(logPath).writeAsString(
+      jsonEncode({
+        'updatedAt': DateTime.now().toIso8601String(),
+        'records': [
+          {
+            'id': '$recordedAt|FET',
+            'recordedAt': recordedAt,
+            'status': 'pending',
+            'signalType': 'startup_buy',
+            'pushProvider': 'feishu',
+            'symbol': 'FET',
+            'entryPrice': 1.00,
+            'score': 0.81,
+            'volumeRatio': 1.8,
+            'dailyBreakoutDistance': 0.6,
+            'reason': '测试记录',
+          }
+        ],
+      }),
+    );
+
+    final service = SignalRunnerService();
+    final payload = await service.refreshStartupPredictionLog(
+      path: logPath,
+      currentCoins: [
+        CoinData(
+          symbol: 'FETUSDT',
+          lastPrice: 1.15,
+          priceChange: 0.05,
+          priceChangePercent: 4.0,
+          highPrice: 1.20,
+          lowPrice: 0.98,
+          openPrice: 1.10,
+          quoteVolume: 1234567,
+          volume: 1000000,
+          count: 3210,
+        ),
+      ],
+    );
+
+    final records = payload['records'] as List<dynamic>;
+    final summary = payload['summary'] as Map<String, dynamic>;
+    final record = records.single as Map<String, dynamic>;
+
+    expect(record['status'], 'settled');
+    expect(record['isWin'], isTrue);
+    expect(record['settlementPrice'], closeTo(1.15, 0.0001));
+    expect(record['returnPercent'], closeTo(15.0, 0.0001));
+
+    expect(summary['totalPredictions'], 1);
+    expect(summary['pending'], 0);
+    expect(summary['settled'], 1);
+    expect(summary['wins'], 1);
+    expect(summary['losses'], 0);
+    expect(summary['winRate'], closeTo(1.0, 0.0001));
+    expect(summary['avgReturnPercent'], closeTo(15.0, 0.0001));
   });
 }
 

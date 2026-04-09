@@ -51,6 +51,12 @@ class NewsItem {
     return '${text.substring(0, 120)}...';
   }
 
+  String get displayDetailBody {
+    final text = translatedBody.isNotEmpty ? translatedBody : body;
+    if (text.trim().isEmpty) return displayTitle;
+    return text.trim();
+  }
+
   /// 是否与自选币相关
   bool isRelatedTo(List<String> symbols) {
     final tagsLower = tags.map((t) => t.toLowerCase()).toSet();
@@ -98,6 +104,39 @@ class NewsItem {
       isHot: true,
     );
   }
+
+  factory NewsItem.fromJson(Map<String, dynamic> json) {
+    return NewsItem(
+      id: json['id']?.toString() ?? '',
+      title: json['title']?.toString() ?? '',
+      body: json['body']?.toString() ?? '',
+      translatedTitle: json['translatedTitle']?.toString() ?? '',
+      translatedBody: json['translatedBody']?.toString() ?? '',
+      url: json['url']?.toString() ?? '',
+      source: json['source']?.toString() ?? '',
+      imageUrl: json['imageUrl']?.toString() ?? '',
+      publishedAt: DateTime.tryParse(json['publishedAt']?.toString() ?? '') ??
+          DateTime.now(),
+      tags: (json['tags'] as List<dynamic>? ?? const [])
+          .map((item) => item.toString())
+          .toList(),
+      isHot: json['isHot'] as bool? ?? false,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'body': body,
+        'translatedTitle': translatedTitle,
+        'translatedBody': translatedBody,
+        'url': url,
+        'source': source,
+        'imageUrl': imageUrl,
+        'publishedAt': publishedAt.toIso8601String(),
+        'tags': tags,
+        'isHot': isHot,
+      };
 
   NewsItem copyWith({
     String? id,

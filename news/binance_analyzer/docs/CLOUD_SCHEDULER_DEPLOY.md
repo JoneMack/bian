@@ -32,7 +32,7 @@ dart run bin/cloud_signal_scheduler.dart
 
 ### 默认行为
 
-- 每 `120` 分钟跑一次
+- 每 `10` 分钟跑一次
 - 启动后立刻跑一次
 - 回放结果超过 `12` 小时会自动重算
 - 同样的推送内容在 `6` 小时内不重复发
@@ -66,6 +66,8 @@ DEDUPE_PUSH=true
 - `GET /latest`
 - `GET /replay`
 - `GET /market-snapshot`
+- `GET /news`
+- `GET /prediction-stats`
 - `GET /market-snapshot?symbols=FETUSDT,TONUSDT`
 - `GET /market-snapshot?symbols=FETUSDT,TONUSDT&refresh=1`
 - `GET /run?token=...`
@@ -86,6 +88,16 @@ DEDUPE_PUSH=true
 - 入场提醒信号
 
 这样 Flutter App 只负责展示和实时轻量价格刷新，不再在手机端做整套历史分析。
+
+### `prediction-stats` 是做什么的
+
+这个接口会直接返回：
+
+- 真正已经推送出去的“全市场启动预测”记录
+- 每条记录的入场价、结算价、收益率、是否命中
+- 当前累计胜率、平均收益、按币种统计
+
+默认按 `24` 小时后自动结算，方便你直接看线上真实命中率。
 
 ## 2. 一次性任务模式
 
@@ -205,7 +217,7 @@ curl "http://localhost:8080/push-test?token=your-secret-token&provider=feishu"
 - `PORT`
   - 默认 `8080`
 - `SIGNAL_INTERVAL_MINUTES`
-  - 默认 `120`
+  - 默认 `10`
 - `MARKET_SNAPSHOT_TTL_SECONDS`
   - 默认 `90`
   - App 拉取 `/market-snapshot` 时的后台缓存秒数
@@ -240,6 +252,7 @@ curl "http://localhost:8080/push-test?token=your-secret-token&provider=feishu"
 
 - `build/reports/daily_signal_report.json`
 - `build/reports/hourly_replay_report.json`
+- `build/reports/startup_buy_log.json`
 - `build/reports/cloud_scheduler_state.json`
 - `build/reports/cloud_push_state.json`
 

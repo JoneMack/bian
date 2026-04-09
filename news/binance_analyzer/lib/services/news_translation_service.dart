@@ -10,21 +10,92 @@ class NewsTranslationService {
     'User-Agent': 'binance-analyzer/1.0 (Flutter)',
   };
 
+  static const Set<String> _noiseWords = {
+    'the',
+    'a',
+    'an',
+    'and',
+    'or',
+    'but',
+    'to',
+    'of',
+    'in',
+    'on',
+    'at',
+    'for',
+    'from',
+    'with',
+    'without',
+    'into',
+    'onto',
+    'over',
+    'under',
+    'after',
+    'before',
+    'amid',
+    'during',
+    'as',
+    'by',
+    'via',
+    'that',
+    'this',
+    'these',
+    'those',
+    'its',
+    'their',
+    'his',
+    'her',
+    'been',
+    'being',
+    'was',
+    'were',
+    'are',
+    'is',
+    'be',
+    'it',
+    'they',
+    'them',
+    'he',
+    'she',
+    'you',
+    'we',
+    'will',
+    'would',
+    'could',
+    'should',
+    'may',
+    'might',
+  };
+
   static const Map<String, String> _phraseMap = {
+    'breaking news': '突发消息',
     'bitcoin etf': '比特币 ETF',
     'ethereum etf': '以太坊 ETF',
+    'spot bitcoin etf': '现货比特币 ETF',
+    'spot ethereum etf': '现货以太坊 ETF',
     'ai tokens': 'AI 代币',
     'crypto market': '加密市场',
     'crypto markets': '加密市场',
+    'market cap': '市值',
     'markets slide': '市场回落',
     'markets rally': '市场走强',
     'markets slump': '市场下跌',
+    'market rebounds': '市场反弹',
+    'market rebound': '市场反弹',
     'etf inflows': 'ETF 资金流入',
     'etf outflows': 'ETF 资金流出',
     'funding rate': '资金费率',
     'open interest': '未平仓合约',
     'price target': '目标价',
+    'price action': '价格表现',
     'profit taking': '获利了结',
+    'all-time high': '历史新高',
+    'record high': '新高',
+    'record low': '新低',
+    'interest rate': '利率',
+    'interest rates': '利率',
+    'rate cut': '降息',
+    'rate cuts': '降息',
     'breaking': '突发',
     'surges': '飙升',
     'surge': '飙升',
@@ -34,6 +105,7 @@ class NewsTranslationService {
     'rally': '上涨',
     'slumps': '下跌',
     'slump': '下跌',
+    'slumped': '下跌',
     'slides': '回落',
     'slide': '回落',
     'soars': '飙升',
@@ -44,33 +116,89 @@ class NewsTranslationService {
     'fall': '下跌',
     'rises': '上涨',
     'rise': '上涨',
+    'rebounds': '反弹',
+    'rebound': '反弹',
+    'retreats': '回调',
+    'retreat': '回调',
     'drops': '下跌',
     'drop': '下跌',
     'hack': '黑客攻击',
     'exploit': '漏洞利用',
     'lawsuit': '诉讼',
     'lawsuits': '诉讼',
+    'settlement': '和解',
+    'settles': '达成和解',
     'listing': '上币',
     'listings': '上币',
     'launches': '推出',
     'launch': '推出',
     'announces': '宣布',
     'announce': '宣布',
+    'reveals': '披露',
+    'reveal': '披露',
     'files': '提交',
     'filed': '已提交',
     'warns': '警告',
+    'warning': '警告',
     'approval': '批准',
     'approved': '获批',
     'rejected': '被拒',
     'delayed': '延期',
+    'delay': '延期',
+    'expands': '扩大',
+    'expand': '扩大',
+    'reacted': '作出反应',
+    'reacts': '作出反应',
+    'reaction': '反应',
+    'moved': '波动',
+    'moves': '波动',
+    'action': '动作',
+    'actions': '动作',
+    'higher': '走高',
+    'lower': '走低',
+    'sharply': '明显',
+    'briefly': '短暂',
+    'signals': '信号',
+    'signal': '信号',
+    'outlook': '前景',
+    'outflows': '资金流出',
+    'outflow': '资金流出',
+    'inflow': '资金流入',
+    'volatility': '波动率',
+    'breaks above': '突破',
+    'break above': '突破',
+    'breaks below': '跌破',
+    'break below': '跌破',
+    'pullback': '回踩',
+    'pulls back': '回踩',
+    'selloff': '抛售',
+    'sell-off': '抛售',
+    'whipsaw': '震荡',
+    'risk-on': '风险偏好回升',
+    'risk off': '风险偏好回落',
+    'risk-off': '风险偏好回落',
     'inflation': '通胀',
     'cpi': 'CPI',
     'fed': '美联储',
+    'sec': 'SEC',
+    'treasury': '美债',
     'tariff': '关税',
     'war': '战争',
+    'liquidation': '爆仓',
+    'liquidations': '爆仓',
+    'short squeeze': '空头挤压',
+    'whale activity': '巨鲸动向',
+    'exchange inflows': '交易所净流入',
+    'exchange outflows': '交易所净流出',
     'bitcoin': '比特币',
     'ethereum': '以太坊',
     'solana': 'Solana',
+    'dogecoin': 'Dogecoin',
+    'ripple': 'Ripple',
+    'xrp': 'XRP',
+    'cardano': 'Cardano',
+    'avalanche': 'Avalanche',
+    'chainlink': 'Chainlink',
     'binance': '币安',
     'markets': '市场',
     'market': '市场',
@@ -95,11 +223,29 @@ class NewsTranslationService {
     'futures': '合约',
     'spot': '现货',
     'inflows': '资金流入',
-    'outflows': '资金流出',
-    'higher': '走高',
-    'lower': '走低',
     'after': '后',
     'amid': '在',
+    'analysts': '分析师',
+    'analyst': '分析师',
+    'investors': '投资者',
+    'investor': '投资者',
+    'institutions': '机构',
+    'institutional': '机构',
+    'watch': '关注',
+    'eyes': '关注',
+    'eyeing': '关注',
+    'boosts': '提振',
+    'boost': '提振',
+    'weighs': '压制',
+    'weigh': '压制',
+    'supports': '支撑',
+    'supported': '受支撑',
+    'pressures': '施压',
+    'pressure': '压力',
+    'gains': '涨幅',
+    'gain': '上涨',
+    'losses': '跌幅',
+    'loss': '下跌',
   };
 
   final http.Client _client;
@@ -206,8 +352,10 @@ class NewsTranslationService {
     required String body,
   }) {
     final translatedTitle = _fallbackTranslateText(title, compact: true);
-    final translatedBody =
-        body.isEmpty ? '' : _fallbackTranslateText(body, compact: false);
+    final translatedBody = _fallbackTranslateText(
+      body.isEmpty ? title : '$title. $body',
+      compact: false,
+    );
 
     return _TranslatedBundle(
       title: translatedTitle,
@@ -273,54 +421,72 @@ class NewsTranslationService {
   static String _fallbackTranslateText(String text, {required bool compact}) {
     final cleaned = _cleanInput(text);
     if (cleaned.isEmpty) return '';
-    if (_looksChinese(cleaned)) return cleaned;
-
-    var translated = cleaned;
-    final entries = _phraseMap.entries.toList()
-      ..sort((a, b) => b.key.length.compareTo(a.key.length));
-
-    for (final entry in entries) {
-      translated = translated.replaceAllMapped(
-        _phrasePattern(entry.key),
-        (_) => entry.value,
+    if (_looksChinese(cleaned)) {
+      return _condenseChineseText(
+        cleaned,
+        maxLength: compact ? 48 : 120,
+        terminate: !compact,
       );
     }
 
-    translated = translated
-        .replaceAllMapped(RegExp(r'\s{2,}'), (_) => ' ')
-        .replaceAll(' ,', '，')
-        .replaceAll(',', '，')
-        .replaceAll(' ;', '；')
-        .replaceAll(';', '；')
-        .replaceAll(' :', '：')
-        .replaceAll(':', '：')
-        .replaceAll(' .', '。')
-        .trim();
+    final localized = _localizeWithPhraseMap(cleaned);
+    final normalized = _normalizeLocalizedText(localized);
 
-    if (_looksChinese(translated)) {
-      return translated;
+    if (_isReadableChinese(normalized)) {
+      final condensed = _condenseChineseText(
+        normalized,
+        maxLength: compact ? 48 : 120,
+        terminate: !compact,
+      );
+      if (!compact && _hasEnglishNoise(condensed)) {
+        final keywords = _extractKeywords(cleaned);
+        if (keywords.isNotEmpty) {
+          return '要点：${keywords.join('，')}。';
+        }
+      }
+      return compact ? condensed : '要点：$condensed';
     }
 
     final keywords = _extractKeywords(cleaned);
-    if (keywords.isEmpty) return '';
+    if (keywords.isEmpty) return compact ? '中文快讯' : '要点：暂无可用中文摘要。';
 
-    final prefix = compact ? '中文速览：' : '重点：';
-    return '$prefix${keywords.join('，')}';
+    final joined = keywords.join('，');
+    return compact ? joined : '要点：$joined。';
   }
 
   static List<String> _extractKeywords(String text) {
-    final lower = text.toLowerCase();
-    final hits = <String>[];
+    final cleaned = _cleanInput(text);
+    if (cleaned.isEmpty) return const [];
+
+    final hits = <_KeywordHit>[];
+    final lower = cleaned.toLowerCase();
 
     for (final entry in _phraseMap.entries) {
       if (entry.key.length < 4) continue;
-      if (lower.contains(entry.key) && !hits.contains(entry.value)) {
-        hits.add(entry.value);
+      final index = lower.indexOf(entry.key);
+      if (index >= 0) {
+        hits.add(_KeywordHit(index, entry.value));
       }
-      if (hits.length >= 5) break;
     }
 
-    return hits;
+    for (final match in RegExp(r'\b[A-Z]{2,10}\b').allMatches(cleaned)) {
+      hits.add(_KeywordHit(match.start, match.group(0)!));
+    }
+
+    for (final match in RegExp(r'\b\d+(?:\.\d+)?%?\b').allMatches(cleaned)) {
+      hits.add(_KeywordHit(match.start, match.group(0)!));
+    }
+
+    hits.sort((a, b) => a.index.compareTo(b.index));
+
+    final ordered = <String>[];
+    for (final hit in hits) {
+      if (ordered.contains(hit.value)) continue;
+      ordered.add(hit.value);
+      if (ordered.length >= 6) break;
+    }
+
+    return ordered;
   }
 
   static String _buildSummarySource(String body, String title) {
@@ -337,6 +503,108 @@ class NewsTranslationService {
 
   static bool _looksChinese(String text) =>
       RegExp(r'[\u4e00-\u9fff]').hasMatch(text);
+
+  static String _localizeWithPhraseMap(String text) {
+    var translated = text;
+    final entries = _phraseMap.entries.toList()
+      ..sort((a, b) => b.key.length.compareTo(a.key.length));
+
+    for (final entry in entries) {
+      translated = translated.replaceAllMapped(
+        _phrasePattern(entry.key),
+        (_) => entry.value,
+      );
+    }
+
+    translated = translated
+        .replaceAll('&amp;', '&')
+        .replaceAllMapped(RegExp(r'\b([a-z]{1,12})\b'), (match) {
+      final word = match.group(1) ?? '';
+      if (_noiseWords.contains(word.toLowerCase())) {
+        return '';
+      }
+      return match.group(0) ?? '';
+    });
+
+    return translated;
+  }
+
+  static String _normalizeLocalizedText(String text) {
+    final normalized = text
+        .replaceAllMapped(RegExp(r'\s+'), (_) => ' ')
+        .replaceAll(' ,', '，')
+        .replaceAll(',', '，')
+        .replaceAll(' ;', '；')
+        .replaceAll(';', '；')
+        .replaceAll(' :', '：')
+        .replaceAll(':', '：')
+        .replaceAll(' .', '。')
+        .replaceAll('.', '。')
+        .replaceAll(' !', '！')
+        .replaceAll('?', '？')
+        .replaceAll(' ；', '；')
+        .replaceAll(' ，', '，')
+        .replaceAll(' 。', '。')
+        .replaceAll(RegExp(r'(，){2,}'), '，')
+        .replaceAll(RegExp(r'(。){2,}'), '。')
+        .replaceAll(RegExp(r'(；){2,}'), '；')
+        .trim();
+
+    final tightened = normalized
+        .replaceAllMapped(
+            RegExp(r'\s*([，。；：！？])\s*'), (match) => match.group(1)!)
+        .replaceAllMapped(RegExp(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])'),
+            (match) => '${match.group(1)}${match.group(2)}')
+        .replaceAllMapped(RegExp(r'([\u4e00-\u9fff])\s+([A-Z0-9])'),
+            (match) => '${match.group(1)}${match.group(2)}')
+        .replaceAllMapped(RegExp(r'([A-Z0-9])\s+([\u4e00-\u9fff])'),
+            (match) => '${match.group(1)}${match.group(2)}');
+
+    return tightened.replaceAll(RegExp(r'^[，。；：]+|[，。；：]+$'), '');
+  }
+
+  static bool _isReadableChinese(String text) {
+    if (!_looksChinese(text)) return false;
+    final englishNoiseCount = RegExp(r'\b[a-z]{4,}\b').allMatches(text).length;
+    return englishNoiseCount <= 2;
+  }
+
+  static bool _hasEnglishNoise(String text) =>
+      RegExp(r'\b[a-z]{3,}\b').hasMatch(text);
+
+  static String _condenseChineseText(
+    String text, {
+    required int maxLength,
+    required bool terminate,
+  }) {
+    final cleaned = _normalizeLocalizedText(text);
+    if (cleaned.isEmpty) return '';
+
+    final parts = cleaned
+        .split(RegExp(r'[。！？；]'))
+        .map((part) => part.trim())
+        .where((part) => part.isNotEmpty)
+        .toList();
+
+    String result;
+    if (parts.isEmpty) {
+      result = cleaned;
+    } else {
+      result = parts.take(2).join('；');
+    }
+
+    if (result.length > maxLength) {
+      result = '${result.substring(0, maxLength)}...';
+    }
+
+    if (terminate &&
+        !result.endsWith('...') &&
+        !RegExp(r'[。！？]$').hasMatch(result)) {
+      result = '$result。';
+    }
+
+    return result;
+  }
 
   static RegExp _phrasePattern(String phrase) => RegExp(
         '(?<![A-Za-z])${RegExp.escape(phrase)}(?![A-Za-z])',
@@ -361,4 +629,11 @@ class _TranslatedBundle {
     required this.title,
     required this.body,
   });
+}
+
+class _KeywordHit {
+  final int index;
+  final String value;
+
+  const _KeywordHit(this.index, this.value);
 }

@@ -3,8 +3,10 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:binance_analyzer/models/market_snapshot.dart';
+import 'package:binance_analyzer/models/news_item.dart';
 import 'package:binance_analyzer/services/binance_service.dart';
 import 'package:binance_analyzer/services/market_snapshot_service.dart';
+import 'package:binance_analyzer/services/news_service.dart';
 import 'package:binance_analyzer/services/signal_runner_service.dart';
 
 Future<void> main() async {
@@ -18,7 +20,10 @@ class CloudSchedulerConfig {
   final Duration interval;
   final Duration replayMaxAge;
   final Duration marketSnapshotTtl;
+  final Duration newsCacheTtl;
   final Duration pushDedupeWindow;
+  final bool enableMarketStartupScanner;
+  final int? marketSymbolLimit;
   final bool runOnStartup;
   final bool runOnce;
   final bool enableInternalScheduler;
@@ -32,6 +37,7 @@ class CloudSchedulerConfig {
   final String? ntfyServer;
   final String dailyReportPath;
   final String replayReportPath;
+  final String buyLogPath;
   final String schedulerStatePath;
   final String pushStatePath;
   final List<String>? watchlistSymbols;
@@ -41,7 +47,10 @@ class CloudSchedulerConfig {
     required this.interval,
     required this.replayMaxAge,
     required this.marketSnapshotTtl,
+    required this.newsCacheTtl,
     required this.pushDedupeWindow,
+    required this.enableMarketStartupScanner,
+    required this.marketSymbolLimit,
     required this.runOnStartup,
     required this.runOnce,
     required this.enableInternalScheduler,
@@ -55,6 +64,7 @@ class CloudSchedulerConfig {
     required this.ntfyServer,
     required this.dailyReportPath,
     required this.replayReportPath,
+    required this.buyLogPath,
     required this.schedulerStatePath,
     required this.pushStatePath,
     required this.watchlistSymbols,
@@ -67,16 +77,22 @@ class CloudSchedulerConfig {
     return CloudSchedulerConfig(
       port: int.tryParse(env['PORT'] ?? '8080') ?? 8080,
       interval: Duration(
-          minutes:
-              int.tryParse(env['SIGNAL_INTERVAL_MINUTES'] ?? '120') ?? 120),
+          minutes: int.tryParse(env['SIGNAL_INTERVAL_MINUTES'] ?? '30') ?? 30),
       replayMaxAge: Duration(
           hours: int.tryParse(env['REPLAY_REFRESH_HOURS'] ?? '12') ?? 12),
       marketSnapshotTtl: Duration(
-        seconds:
-            int.tryParse(env['MARKET_SNAPSHOT_TTL_SECONDS'] ?? '90') ?? 90,
+        seconds: int.tryParse(env['MARKET_SNAPSHOT_TTL_SECONDS'] ?? '90') ?? 90,
+      ),
+      newsCacheTtl: Duration(
+        seconds: int.tryParse(env['NEWS_CACHE_TTL_SECONDS'] ?? '180') ?? 180,
       ),
       pushDedupeWindow:
           Duration(hours: int.tryParse(env['PUSH_DEDUPE_HOURS'] ?? '6') ?? 6),
+      enableMarketStartupScanner: _boolFromEnv(
+        env['ENABLE_MARKET_STARTUP_SCANNER'],
+        fallback: true,
+      ),
+      marketSymbolLimit: _intFromEnv(env['MARKET_SYMBOL_LIMIT']),
       runOnStartup: _boolFromEnv(env['RUN_ON_STARTUP'], fallback: true),
       runOnce: runOnce,
       enableInternalScheduler: _boolFromEnv(
@@ -96,6 +112,8 @@ class CloudSchedulerConfig {
           SignalRunnerService.defaultDailyReportPath,
       replayReportPath: env['REPLAY_REPORT_PATH'] ??
           SignalRunnerService.defaultReplayReportPath,
+      buyLogPath:
+          env['BUY_LOG_PATH'] ?? SignalRunnerService.defaultStartupBuyLogPath,
       schedulerStatePath: env['SCHEDULER_STATE_PATH'] ??
           'build/reports/cloud_scheduler_state.json',
       pushStatePath:
@@ -132,12 +150,20 @@ class CloudSchedulerConfig {
         .toList()
       ..sort();
   }
+
+  static int? _intFromEnv(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return null;
+    final value = int.tryParse(raw.trim());
+    if (value == null || value <= 0) return null;
+    return value;
+  }
 }
 
 class _CloudSignalSchedulerApp {
   final CloudSchedulerConfig config;
   final SignalRunnerService _service = SignalRunnerService();
   final MarketSnapshotService _snapshotService = MarketSnapshotService();
+  final NewsService _newsService = NewsService();
 
   HttpServer? _server;
   bool _running = false;
@@ -153,6 +179,10 @@ class _CloudSignalSchedulerApp {
   Map<String, dynamic>? _latestReplay;
   MarketSnapshot? _latestSnapshot;
   String? _latestSnapshotKey;
+  List<NewsItem>? _latestNews;
+  String? _latestNewsKey;
+  DateTime? _latestNewsAt;
+  Map<String, dynamic>? _latestPredictionLog;
   PushDeliveryResult? _lastPush;
 
   _CloudSignalSchedulerApp(this.config);
@@ -162,6 +192,7 @@ class _CloudSignalSchedulerApp {
 
     stdout.writeln(
       'Push config: publish=${config.publishPush} '
+      'mode=${config.enableMarketStartupScanner ? 'market_startup' : 'watchlist_rotation'} '
       'provider=${config.pushProvider.name} '
       'effective=${_effectivePushProviderName() ?? 'none'} '
       'feishuConfigured=${_hasFeishuWebhook()} '
@@ -203,6 +234,7 @@ class _CloudSignalSchedulerApp {
     final state = await _service.loadJsonArtifact(config.schedulerStatePath);
     _latestReport = await _loadIfPresent(config.dailyReportPath);
     _latestReplay = await _loadIfPresent(config.replayReportPath);
+    _latestPredictionLog = await _loadIfPresent(config.buyLogPath);
     _lastRunAt = DateTime.tryParse(state['lastRunAt'] as String? ?? '');
     _lastStatus = state['lastStatus'] as String? ?? _lastStatus;
     _lastError = state['lastError'] as String?;
@@ -236,11 +268,14 @@ class _CloudSignalSchedulerApp {
           'latestEndpoint': '/latest',
           'replayEndpoint': '/replay',
           'marketSnapshotEndpoint': '/market-snapshot',
+          'newsEndpoint': '/news',
+          'predictionStatsEndpoint': '/prediction-stats',
           'runEndpoint': '/run',
           'pushTestEndpoint': '/push-test',
           'internalScheduler': config.enableInternalScheduler,
           'manualRunRequiresToken': (config.runnerToken?.isNotEmpty ?? false),
           'marketSnapshotCacheSeconds': config.marketSnapshotTtl.inSeconds,
+          'newsCacheSeconds': config.newsCacheTtl.inSeconds,
           'pushProvider': config.pushProvider.name,
           'effectivePushProvider': _effectivePushProviderName(),
         });
@@ -288,6 +323,42 @@ class _CloudSignalSchedulerApp {
           forceRefresh: forceRefresh,
         );
         await _writeJson(request.response, HttpStatus.ok, snapshot.toJson());
+        return;
+      }
+
+      if (request.method == 'GET' && path == '/news') {
+        final limit = _requestedNewsLimitFrom(request);
+        final requestedCategories = _requestedNewsCategoriesFrom(request);
+        final forceRefresh = request.uri.queryParameters['refresh'] == '1';
+        final items = await _loadNewsFeed(
+          limit: limit,
+          requestedCategories: requestedCategories,
+          forceRefresh: forceRefresh,
+        );
+        await _writeJson(request.response, HttpStatus.ok, {
+          'items': items.map((item) => item.toJson()).toList(),
+          'limit': limit,
+          'categories': requestedCategories,
+          'updatedAt': _latestNewsAt?.toIso8601String(),
+          'cacheTtlSeconds': config.newsCacheTtl.inSeconds,
+        });
+        return;
+      }
+
+      if (request.method == 'GET' && path == '/prediction-stats') {
+        final forceRefresh = request.uri.queryParameters['refresh'] == '1';
+        final payload = forceRefresh || _latestPredictionLog?['summary'] == null
+            ? await _service.refreshStartupPredictionLog(
+                path: config.buyLogPath)
+            : (_latestPredictionLog ?? await _loadIfPresent(config.buyLogPath));
+        if (payload == null || payload.isEmpty) {
+          await _writeJson(request.response, HttpStatus.notFound, {
+            'error': 'prediction stats not found',
+          });
+          return;
+        }
+        _latestPredictionLog = payload;
+        await _writeJson(request.response, HttpStatus.ok, payload);
         return;
       }
 
@@ -346,8 +417,7 @@ class _CloudSignalSchedulerApp {
           message: request.uri.queryParameters['message'],
         );
 
-        final statusCode =
-            result.sent ? HttpStatus.ok : HttpStatus.badRequest;
+        final statusCode = result.sent ? HttpStatus.ok : HttpStatus.badRequest;
         await _writeJson(request.response, statusCode, {
           'status': result.sent ? 'ok' : 'skipped',
           'result': result.toJson(),
@@ -376,7 +446,7 @@ class _CloudSignalSchedulerApp {
     await _saveState();
 
     try {
-      if (config.refreshReplayBeforeRun) {
+      if (!config.enableMarketStartupScanner && config.refreshReplayBeforeRun) {
         final replay = await _service.ensureFreshReplayReport(
           requestedSymbols: config.watchlistSymbols,
           replayReportPath: config.replayReportPath,
@@ -390,36 +460,72 @@ class _CloudSignalSchedulerApp {
         );
       }
 
-      final result = await _service.runDailySignal(
-        requestedSymbols: config.watchlistSymbols,
-        dailyReportPath: config.dailyReportPath,
-        replayReportPath: config.replayReportPath,
-        pushProvider: config.pushProvider,
-        feishuWebhookUrl: config.feishuWebhookUrl,
-        ntfyTopic: config.ntfyTopic,
-        ntfyServer: config.ntfyServer,
-        publishPush: config.publishPush,
-        dedupePush: config.dedupePush,
-        pushStatePath: config.pushStatePath,
-        pushDedupeWindow: config.pushDedupeWindow,
-      );
+      if (config.enableMarketStartupScanner) {
+        final result = await _service.runMarketStartupScan(
+          requestedSymbols: config.watchlistSymbols,
+          symbolLimit: config.marketSymbolLimit,
+          reportPath: config.dailyReportPath,
+          buyLogPath: config.buyLogPath,
+          pushProvider: config.pushProvider,
+          feishuWebhookUrl: config.feishuWebhookUrl,
+          ntfyTopic: config.ntfyTopic,
+          ntfyServer: config.ntfyServer,
+          publishPush: config.publishPush,
+          dedupePush: config.dedupePush,
+          pushStatePath: config.pushStatePath,
+          pushDedupeWindow: config.pushDedupeWindow,
+        );
 
-      _latestReport = result.payload;
-      _lastPush = result.pushResult;
-      _lastRunAt = result.generatedAt;
-      _lastStatus = 'ok';
-      _lastError = null;
-      _runCount += 1;
-      _latestSnapshot = null;
-      _latestSnapshotKey = null;
+        _latestReport = result.payload;
+        _lastPush = result.pushResult;
+        _lastRunAt = result.generatedAt;
+        _lastStatus = 'ok';
+        _lastError = null;
+        _runCount += 1;
+        _latestSnapshot = null;
+        _latestSnapshotKey = null;
+        _latestPredictionLog = result.predictionLog;
 
-      stdout.writeln(
-        '[${result.generatedAt.toIso8601String()}] $trigger '
-        'preset=${result.engine.report.presetLabel} '
-        'push=${result.pushResult.status} '
-        'provider=${result.pushResult.provider} '
-        'message=${result.pushResult.message}',
-      );
+        stdout.writeln(
+          '[${result.generatedAt.toIso8601String()}] $trigger '
+          'mode=market_startup '
+          'candidates=${result.report.actionableCandidates.length} '
+          'push=${result.pushResult.status} '
+          'provider=${result.pushResult.provider} '
+          'message=${result.pushResult.message}',
+        );
+      } else {
+        final result = await _service.runDailySignal(
+          requestedSymbols: config.watchlistSymbols,
+          dailyReportPath: config.dailyReportPath,
+          replayReportPath: config.replayReportPath,
+          pushProvider: config.pushProvider,
+          feishuWebhookUrl: config.feishuWebhookUrl,
+          ntfyTopic: config.ntfyTopic,
+          ntfyServer: config.ntfyServer,
+          publishPush: config.publishPush,
+          dedupePush: config.dedupePush,
+          pushStatePath: config.pushStatePath,
+          pushDedupeWindow: config.pushDedupeWindow,
+        );
+
+        _latestReport = result.payload;
+        _lastPush = result.pushResult;
+        _lastRunAt = result.generatedAt;
+        _lastStatus = 'ok';
+        _lastError = null;
+        _runCount += 1;
+        _latestSnapshot = null;
+        _latestSnapshotKey = null;
+
+        stdout.writeln(
+          '[${result.generatedAt.toIso8601String()}] $trigger '
+          'preset=${result.engine.report.presetLabel} '
+          'push=${result.pushResult.status} '
+          'provider=${result.pushResult.provider} '
+          'message=${result.pushResult.message}',
+        );
+      }
     } catch (error, stackTrace) {
       _lastRunAt = DateTime.now();
       _lastStatus = 'error';
@@ -463,17 +569,40 @@ class _CloudSignalSchedulerApp {
       'nextRunAt': _nextRunAt?.toIso8601String(),
       'runCount': _runCount,
       'intervalMinutes': config.interval.inMinutes,
+      'mode': config.enableMarketStartupScanner
+          ? 'market_startup'
+          : 'watchlist_rotation',
       'dailyReportPath': config.dailyReportPath,
       'replayReportPath': config.replayReportPath,
+      'buyLogPath': config.buyLogPath,
       'marketSnapshotCacheSeconds': config.marketSnapshotTtl.inSeconds,
+      'newsCacheSeconds': config.newsCacheTtl.inSeconds,
       'latestSnapshotAt': _latestSnapshot?.updatedAt.toIso8601String(),
       'latestSnapshotSymbols': _latestSnapshot?.watchlistSymbols,
+      'latestNewsAt': _latestNewsAt?.toIso8601String(),
+      'latestNewsCount': _latestNews?.length,
+      'startupPredictionSummary': _latestPredictionLog?['summary'],
+      'startupPredictionUpdatedAt': _latestPredictionLog?['updatedAt'],
       'lastPush': _lastPush?.toJson(),
-      'latestTop3': (_latestReport?['top3'] as List<dynamic>? ?? const [])
-          .take(3)
-          .toList(),
+      'latestTop3': _latestSummaryItems(),
       ..._pushConfigPayload(),
     };
+  }
+
+  List<dynamic> _latestSummaryItems() {
+    final top3 = _latestReport?['top3'];
+    if (top3 is List) return top3.take(3).toList();
+
+    final actionable = _latestReport?['actionableCandidates'];
+    if (actionable is List) return actionable.take(3).toList();
+
+    final nestedReport = _latestReport?['report'];
+    if (nestedReport is Map) {
+      final candidates = nestedReport['candidates'];
+      if (candidates is List) return candidates.take(3).toList();
+    }
+
+    return const [];
   }
 
   Map<String, dynamic> _pushConfigPayload() {
@@ -489,7 +618,8 @@ class _CloudSignalSchedulerApp {
     };
   }
 
-  bool _hasFeishuWebhook() => config.feishuWebhookUrl?.trim().isNotEmpty ?? false;
+  bool _hasFeishuWebhook() =>
+      config.feishuWebhookUrl?.trim().isNotEmpty ?? false;
 
   bool _hasNtfyTopic() => config.ntfyTopic?.trim().isNotEmpty ?? false;
 
@@ -520,10 +650,44 @@ class _CloudSignalSchedulerApp {
     return _normalizeSymbols(source);
   }
 
+  int _requestedNewsLimitFrom(HttpRequest request) {
+    final parsed = int.tryParse(request.uri.queryParameters['limit'] ?? '');
+    if (parsed == null || parsed <= 0) {
+      return 40;
+    }
+    if (parsed > 80) {
+      return 80;
+    }
+    return parsed;
+  }
+
+  List<String> _requestedNewsCategoriesFrom(HttpRequest request) {
+    final raw = request.uri.queryParameters['categories'];
+    final source = raw == null || raw.trim().isEmpty
+        ? (config.watchlistSymbols ?? BinanceService.defaultWatchlistSymbols)
+            .map((symbol) => symbol.replaceAll('USDT', ''))
+            .toList()
+        : raw.split(',');
+    return _normalizeCategories(source);
+  }
+
   List<String> _normalizeSymbols(List<String> symbols) {
     final unique = <String>{};
     for (final symbol in symbols) {
       final normalized = BinanceService.toSymbol(symbol);
+      if (normalized.isNotEmpty) {
+        unique.add(normalized);
+      }
+    }
+    final ordered = unique.toList();
+    ordered.sort();
+    return ordered;
+  }
+
+  List<String> _normalizeCategories(List<String> categories) {
+    final unique = <String>{};
+    for (final category in categories) {
+      final normalized = category.trim().toUpperCase();
       if (normalized.isNotEmpty) {
         unique.add(normalized);
       }
@@ -546,7 +710,8 @@ class _CloudSignalSchedulerApp {
     if (!forceRefresh &&
         cached != null &&
         _latestSnapshotKey == cacheKey &&
-        DateTime.now().difference(cached.updatedAt) <= config.marketSnapshotTtl) {
+        DateTime.now().difference(cached.updatedAt) <=
+            config.marketSnapshotTtl) {
       return cached;
     }
 
@@ -578,6 +743,33 @@ class _CloudSignalSchedulerApp {
     return snapshot;
   }
 
+  Future<List<NewsItem>> _loadNewsFeed({
+    required int limit,
+    required List<String> requestedCategories,
+    bool forceRefresh = false,
+  }) async {
+    final cacheKey = '$limit|${requestedCategories.join(',')}';
+    final cached = _latestNews;
+
+    if (!forceRefresh &&
+        cached != null &&
+        _latestNewsAt != null &&
+        _latestNewsKey == cacheKey &&
+        DateTime.now().difference(_latestNewsAt!) <= config.newsCacheTtl) {
+      return cached;
+    }
+
+    final items = await _newsService.fetchNews(
+      limit: limit,
+      categories: requestedCategories,
+    );
+
+    _latestNews = items;
+    _latestNewsKey = cacheKey;
+    _latestNewsAt = DateTime.now();
+    return items;
+  }
+
   Future<Map<String, dynamic>?> _loadIfPresent(String path) async {
     final payload = await _service.loadJsonArtifact(path);
     return payload.isEmpty ? null : payload;
@@ -596,6 +788,9 @@ class _CloudSignalSchedulerApp {
         'nextRunAt': _nextRunAt?.toIso8601String(),
         'runCount': _runCount,
         'intervalMinutes': config.interval.inMinutes,
+        'mode': config.enableMarketStartupScanner
+            ? 'market_startup'
+            : 'watchlist_rotation',
         'lastPush': _lastPush?.toJson(),
       },
     );

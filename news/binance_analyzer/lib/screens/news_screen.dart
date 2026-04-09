@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:url_launcher/url_launcher.dart';
 import '../models/news_item.dart';
+import '../services/backend_api_service.dart';
 import '../services/news_service.dart';
 import '../services/binance_service.dart';
 import '../theme/app_theme.dart';
@@ -18,6 +18,7 @@ class NewsScreen extends StatefulWidget {
 class _NewsScreenState extends State<NewsScreen>
     with AutomaticKeepAliveClientMixin {
   final _svc = NewsService();
+  final _backend = BackendApiService();
   List<NewsItem> _news = [];
   List<NewsItem> _filtered = [];
   bool _loading = true;
@@ -64,7 +65,14 @@ class _NewsScreenState extends State<NewsScreen>
 
     try {
       final categories = _watchlistNames.take(10).toList(); // 限制请求参数长度
-      final news = await _svc.fetchNews(limit: 40, categories: categories);
+      final forceRefresh = !silent && _lastUpdated != null;
+      final news = _backend.isConfigured
+          ? await _backend.fetchNewsFeed(
+              limit: 40,
+              categories: categories,
+              forceRefresh: forceRefresh,
+            )
+          : await _svc.fetchNews(limit: 40, categories: categories);
 
       if (mounted) {
         setState(() {
@@ -98,8 +106,8 @@ class _NewsScreenState extends State<NewsScreen>
         break;
       default:
         _filtered = _news
-            .where((n) =>
-                n.tags.any((t) => t.toLowerCase() == _selectedTag.toLowerCase()))
+            .where((n) => n.tags
+                .any((t) => t.toLowerCase() == _selectedTag.toLowerCase()))
             .toList();
     }
   }
@@ -153,8 +161,8 @@ class _NewsScreenState extends State<NewsScreen>
           if (_lastUpdated != null)
             Text(
               '更新于 ${_formatTime(_lastUpdated!)} · 下次3分钟后',
-              style: const TextStyle(
-                  color: AppTheme.textSecondary, fontSize: 10),
+              style:
+                  const TextStyle(color: AppTheme.textSecondary, fontSize: 10),
             ),
         ],
       ),
@@ -167,8 +175,7 @@ class _NewsScreenState extends State<NewsScreen>
                   height: 18,
                   child: CircularProgressIndicator(
                       strokeWidth: 2, color: AppTheme.binanceYellow))
-              : const Icon(Icons.refresh_rounded,
-                  color: AppTheme.textPrimary),
+              : const Icon(Icons.refresh_rounded, color: AppTheme.textPrimary),
         ),
       ],
       bottom: PreferredSize(
@@ -198,28 +205,21 @@ class _NewsScreenState extends State<NewsScreen>
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 150),
               margin: const EdgeInsets.only(right: 8),
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               decoration: BoxDecoration(
-                color: selected
-                    ? AppTheme.binanceYellow
-                    : AppTheme.cardDark,
+                color: selected ? AppTheme.binanceYellow : AppTheme.cardDark,
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(
-                    color: selected
-                        ? AppTheme.binanceYellow
-                        : AppTheme.cardLight),
+                    color:
+                        selected ? AppTheme.binanceYellow : AppTheme.cardLight),
               ),
               child: Text(
                 tag,
                 style: TextStyle(
-                  color: selected
-                      ? AppTheme.binanceDark
-                      : AppTheme.textSecondary,
+                  color:
+                      selected ? AppTheme.binanceDark : AppTheme.textSecondary,
                   fontSize: 12,
-                  fontWeight: selected
-                      ? FontWeight.bold
-                      : FontWeight.normal,
+                  fontWeight: selected ? FontWeight.bold : FontWeight.normal,
                 ),
               ),
             ),
@@ -230,15 +230,13 @@ class _NewsScreenState extends State<NewsScreen>
   }
 
   Widget _buildBody() {
-    final list = _filtered.isEmpty && _selectedTag != '全部'
-        ? <NewsItem>[]
-        : _filtered;
+    final list =
+        _filtered.isEmpty && _selectedTag != '全部' ? <NewsItem>[] : _filtered;
 
     if (list.isEmpty) {
       return const Center(
         child: Text('暂无相关资讯',
-            style:
-                TextStyle(color: AppTheme.textSecondary, fontSize: 14)),
+            style: TextStyle(color: AppTheme.textSecondary, fontSize: 14)),
       );
     }
 
@@ -273,7 +271,7 @@ class _HeroNewsCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: () => _openUrl(context, item.url),
+      onTap: () => _showNewsDetailSheet(context, item),
       onLongPress: () => _copyUrl(context, item.url),
       child: Container(
         margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
@@ -328,7 +326,7 @@ class _HeroNewsCard extends StatelessWidget {
                               fontWeight: FontWeight.bold)),
                     ),
                   Text(
-                    item.title,
+                    item.displayTitle,
                     style: const TextStyle(
                         color: AppTheme.textPrimary,
                         fontSize: 16,
@@ -339,7 +337,7 @@ class _HeroNewsCard extends StatelessWidget {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    item.summary,
+                    item.displaySummary,
                     style: const TextStyle(
                         color: AppTheme.textSecondary,
                         fontSize: 13,
@@ -383,7 +381,7 @@ class _NewsCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: () => _openUrl(context, item.url),
+      onTap: () => _showNewsDetailSheet(context, item),
       onLongPress: () => _copyUrl(context, item.url),
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -410,13 +408,23 @@ class _NewsCard extends StatelessWidget {
                               fontWeight: FontWeight.bold)),
                     ),
                   Text(
-                    item.title,
+                    item.displayTitle,
                     style: const TextStyle(
                         color: AppTheme.textPrimary,
                         fontSize: 14,
                         fontWeight: FontWeight.w600,
                         height: 1.4),
                     maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    item.displaySummary,
+                    style: const TextStyle(
+                        color: AppTheme.textSecondary,
+                        fontSize: 12,
+                        height: 1.5),
+                    maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 6),
@@ -473,26 +481,23 @@ class _MetaRow extends StatelessWidget {
     return Row(
       children: [
         Container(
-          padding:
-              const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
           decoration: BoxDecoration(
             color: AppTheme.cardLight,
             borderRadius: BorderRadius.circular(4),
           ),
           child: Text(
             item.source,
-            style: const TextStyle(
-                color: AppTheme.textSecondary, fontSize: 10),
+            style: const TextStyle(color: AppTheme.textSecondary, fontSize: 10),
           ),
         ),
         const SizedBox(width: 8),
         Text(
           item.timeAgo,
-          style: const TextStyle(
-              color: AppTheme.textSecondary, fontSize: 11),
+          style: const TextStyle(color: AppTheme.textSecondary, fontSize: 11),
         ),
         const Spacer(),
-        const Icon(Icons.open_in_new,
+        const Icon(Icons.notes_rounded,
             color: AppTheme.textSecondary, size: 13),
       ],
     );
@@ -501,33 +506,283 @@ class _MetaRow extends StatelessWidget {
 
 // ── 辅助函数 ────────────────────────────────────────────────
 
-Future<void> _openUrl(BuildContext context, String urlStr) async {
-  final uri = Uri.tryParse(urlStr);
-  if (uri == null) return;
-  try {
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    } else {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('无法打开链接，请手动复制'),
-            backgroundColor: AppTheme.cardLight,
-          ),
-        );
-      }
-    }
-  } catch (_) {}
+Future<void> _showNewsDetailSheet(BuildContext context, NewsItem item) async {
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (sheetContext) {
+      return FractionallySizedBox(
+        heightFactor: 0.88,
+        child: _NewsDetailSheet(item: item),
+      );
+    },
+  );
 }
 
 Future<void> _copyUrl(BuildContext context, String url) async {
+  if (url.trim().isEmpty) return;
   await Clipboard.setData(ClipboardData(text: url));
   if (context.mounted) {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('链接已复制'),
+        content: Text('原文链接已复制'),
         backgroundColor: AppTheme.cardLight,
         duration: Duration(seconds: 1),
+      ),
+    );
+  }
+}
+
+Future<void> _copyNewsBrief(BuildContext context, NewsItem item) async {
+  final buffer = StringBuffer()
+    ..writeln(item.displayTitle)
+    ..writeln()
+    ..writeln(item.displayDetailBody);
+
+  if (item.url.trim().isNotEmpty) {
+    buffer
+      ..writeln()
+      ..writeln('原文链接：${item.url}');
+  }
+
+  await Clipboard.setData(ClipboardData(text: buffer.toString().trim()));
+  if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('资讯摘要已复制'),
+        backgroundColor: AppTheme.cardLight,
+        duration: Duration(seconds: 1),
+      ),
+    );
+  }
+}
+
+class _NewsDetailSheet extends StatelessWidget {
+  final NewsItem item;
+  const _NewsDetailSheet({required this.item});
+
+  @override
+  Widget build(BuildContext context) {
+    final tags =
+        item.tags.where((tag) => tag.trim().isNotEmpty).take(6).toList();
+
+    return SafeArea(
+      top: false,
+      child: Container(
+        decoration: const BoxDecoration(
+          color: AppTheme.cardDark,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          children: [
+            const SizedBox(height: 10),
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppTheme.cardLight,
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(18, 16, 18, 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              _DetailChip(
+                                label: item.source,
+                                color: AppTheme.cardLight,
+                                textColor: AppTheme.textSecondary,
+                              ),
+                              _DetailChip(
+                                label: item.timeAgo,
+                                color: AppTheme.cardLight,
+                                textColor: AppTheme.textSecondary,
+                              ),
+                              if (item.isHot)
+                                const _DetailChip(
+                                  label: '热点',
+                                  color: AppTheme.red,
+                                  textColor: AppTheme.textPrimary,
+                                ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.of(context).pop(),
+                          icon: const Icon(Icons.close_rounded,
+                              color: AppTheme.textSecondary),
+                        ),
+                      ],
+                    ),
+                    if (item.imageUrl.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(16),
+                        child: Image.network(
+                          item.imageUrl,
+                          width: double.infinity,
+                          height: 180,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) => _detailPlaceholder(),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    Text(
+                      item.displayTitle,
+                      style: const TextStyle(
+                        color: AppTheme.textPrimary,
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        height: 1.45,
+                      ),
+                    ),
+                    if (item.displayTitle != item.title) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        '原文标题：${item.title}',
+                        style: const TextStyle(
+                          color: AppTheme.textSecondary,
+                          fontSize: 11,
+                          height: 1.5,
+                        ),
+                      ),
+                    ],
+                    if (tags.isNotEmpty) ...[
+                      const SizedBox(height: 14),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final tag in tags)
+                            _DetailChip(
+                              label: tag,
+                              color: AppTheme.binanceYellow.withAlpha(28),
+                              textColor: AppTheme.binanceYellow,
+                            ),
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 18),
+                    const Text(
+                      '中文简报',
+                      style: TextStyle(
+                        color: AppTheme.textPrimary,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: AppTheme.binanceDark,
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: AppTheme.cardLight),
+                      ),
+                      child: Text(
+                        item.displayDetailBody,
+                        style: const TextStyle(
+                          color: AppTheme.textSecondary,
+                          fontSize: 14,
+                          height: 1.7,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: () => _copyNewsBrief(context, item),
+                            icon: const Icon(Icons.content_copy_rounded,
+                                size: 16),
+                            label: const Text('复制摘要'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppTheme.textPrimary,
+                              side: const BorderSide(color: AppTheme.cardLight),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: item.url.trim().isEmpty
+                                ? null
+                                : () => _copyUrl(context, item.url),
+                            icon: const Icon(Icons.link_rounded, size: 16),
+                            label: const Text('复制原文链接'),
+                            style: FilledButton.styleFrom(
+                              backgroundColor: AppTheme.binanceYellow,
+                              foregroundColor: AppTheme.binanceDark,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _detailPlaceholder() {
+    return Container(
+      height: 180,
+      width: double.infinity,
+      color: AppTheme.cardLight,
+      child: const Center(
+        child: Icon(Icons.article_rounded,
+            color: AppTheme.textSecondary, size: 44),
+      ),
+    );
+  }
+}
+
+class _DetailChip extends StatelessWidget {
+  final String label;
+  final Color color;
+  final Color textColor;
+
+  const _DetailChip({
+    required this.label,
+    required this.color,
+    required this.textColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: textColor,
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+        ),
       ),
     );
   }
@@ -571,8 +826,7 @@ class _ErrorView extends StatelessWidget {
           const SizedBox(height: 8),
           Text(
             error.length > 200 ? '${error.substring(0, 200)}...' : error,
-            style: const TextStyle(
-                color: AppTheme.textSecondary, fontSize: 12),
+            style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12),
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),

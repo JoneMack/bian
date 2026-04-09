@@ -58,6 +58,8 @@ void main() {
     expect(localized.translatedTitle, contains('市场'));
     expect(localized.translatedTitle, contains('SEC'));
     expect(localized.translatedTitle, contains('诉讼'));
+    expect(localized.translatedBody, startsWith('要点：'));
+    expect(localized.displayDetailBody, contains('市场'));
     expect(localized.displaySummary, isNotEmpty);
     expect(localized.hasChineseTranslation, isTrue);
   });
