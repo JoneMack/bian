@@ -16,6 +16,11 @@ void main() {
       minMomentumScore: 0.18,
       minMarketTrendBreadth: 0.0,
       minMarketMomentumBreadth: 0.0,
+      minMarketTrendBreadthForEntry: 0.0,
+      minMarketMomentumBreadthForEntry: 0.0,
+      minMarketVolumeBreadthForEntry: 0.0,
+      maxRedBreadthForEntry: 1.0,
+      maxDeepRedBreadthForEntry: 1.0,
       minVolumeRatio: 1.20,
       minDailyChangePercent: 0.5,
       maxPushCandidates: 3,
@@ -93,6 +98,66 @@ void main() {
           .shouldNotify,
       isFalse,
     );
+  });
+
+  test('blocks startup buy when BTC and ETH benchmark regime is weak', () {
+    final service = StartupScannerService();
+    final policy = StartupScanPolicy.defaultPolicy.copyWith(
+      label: '基准过滤测试',
+      minScore: 0.68,
+      minTrendScore: 0.58,
+      minCompressionScore: 0.12,
+      minLiquidityScore: 0.0,
+      minMomentumScore: 0.18,
+      minMarketTrendBreadth: 0.0,
+      minMarketMomentumBreadth: 0.0,
+      minMarketTrendBreadthForEntry: 0.0,
+      minMarketMomentumBreadthForEntry: 0.0,
+      minMarketVolumeBreadthForEntry: 0.0,
+      maxRedBreadthForEntry: 1.0,
+      maxDeepRedBreadthForEntry: 1.0,
+      minVolumeRatio: 1.20,
+      minDailyChangePercent: 0.5,
+      maxPushCandidates: 3,
+    );
+    final now = DateTime.now();
+    final breakoutCoin = CoinData(
+      symbol: 'STARTUSDT',
+      lastPrice: 9.18,
+      priceChange: 0.34,
+      priceChangePercent: 3.8,
+      highPrice: 9.22,
+      lowPrice: 8.82,
+      openPrice: 8.84,
+      quoteVolume: 18000000,
+      volume: 2100000,
+      count: 24000,
+    );
+
+    final report = service.analyzeMarket(
+      currentCoins: [breakoutCoin],
+      dailyHistory: {
+        'STARTUSDT': _buildBreakoutDailyBars(now),
+        'BTCUSDT': _buildWeakBenchmarkDailyBars(now, 68000),
+        'ETHUSDT': _buildWeakBenchmarkDailyBars(now, 3200),
+      },
+      hourlyHistory: {
+        'STARTUSDT': _buildBreakoutHourlyBars(now),
+        'BTCUSDT': _buildWeakBenchmarkHourlyBars(now, 68000),
+        'ETHUSDT': _buildWeakBenchmarkHourlyBars(now, 3200),
+      },
+      policy: policy,
+    );
+
+    expect(report.marketRegime.allowEntries, isFalse);
+    expect(report.marketRegime.benchmarkStatus, 'weak');
+    expect(report.marketRegime.benchmarkScore, lessThan(0.56));
+    expect(report.candidates, isNotEmpty);
+    expect(report.candidates.first.symbol, 'START');
+    expect(report.candidates.first.shouldWatch, isTrue);
+    expect(report.candidates.first.shouldNotify, isFalse);
+    expect(report.candidates.first.blockedByMarket, isTrue);
+    expect(report.candidates.first.signalStage, 'blocked_by_market');
   });
 }
 
@@ -202,6 +267,40 @@ List<Kline> _buildFillerHourlyBars(DateTime now, int seed) {
       close: close,
       quoteVolume: 110000 + seed * 12000,
       tradeCount: 500 + seed * 30,
+    ));
+  }
+  return bars;
+}
+
+List<Kline> _buildWeakBenchmarkDailyBars(DateTime now, double startPrice) {
+  final bars = <Kline>[];
+  for (var i = 0; i < 60; i++) {
+    final close = startPrice - i * (startPrice * 0.006);
+    bars.add(_bar(
+      closeTime: now.subtract(Duration(days: 60 - i)),
+      open: close + startPrice * 0.002,
+      high: close + startPrice * 0.004,
+      low: close - startPrice * 0.005,
+      close: close,
+      quoteVolume: 4200000,
+      tradeCount: 18000,
+    ));
+  }
+  return bars;
+}
+
+List<Kline> _buildWeakBenchmarkHourlyBars(DateTime now, double startPrice) {
+  final bars = <Kline>[];
+  for (var i = 0; i < 48; i++) {
+    final close = startPrice - i * (startPrice * 0.0014);
+    bars.add(_bar(
+      closeTime: now.subtract(Duration(hours: 48 - i)),
+      open: close + startPrice * 0.0004,
+      high: close + startPrice * 0.0008,
+      low: close - startPrice * 0.0012,
+      close: close,
+      quoteVolume: 900000,
+      tradeCount: 6000,
     ));
   }
   return bars;

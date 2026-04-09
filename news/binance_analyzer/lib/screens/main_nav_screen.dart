@@ -12,6 +12,7 @@ import '../services/notification_service.dart';
 import '../services/realtime_service.dart';
 import '../services/watchlist_service.dart';
 import '../theme/app_theme.dart';
+import '../utils/signal_action_helper.dart';
 import 'history_screen.dart';
 import 'market_screen.dart';
 import 'news_screen.dart';
@@ -26,6 +27,7 @@ class MarketState {
   final bool liveConnected;
   final StrategyBacktestReport? engineReport;
   final List<EntryAlertSignal> entryAlerts;
+  final List<EntryAlertSignal> exitAlerts;
   final List<String> watchlistSymbols;
 
   const MarketState({
@@ -37,6 +39,7 @@ class MarketState {
     this.liveConnected = false,
     this.engineReport,
     this.entryAlerts = const [],
+    this.exitAlerts = const [],
     this.watchlistSymbols = const [],
   });
 
@@ -49,6 +52,7 @@ class MarketState {
     bool? liveConnected,
     StrategyBacktestReport? engineReport,
     List<EntryAlertSignal>? entryAlerts,
+    List<EntryAlertSignal>? exitAlerts,
     List<String>? watchlistSymbols,
   }) {
     return MarketState(
@@ -60,6 +64,7 @@ class MarketState {
       liveConnected: liveConnected ?? this.liveConnected,
       engineReport: engineReport ?? this.engineReport,
       entryAlerts: entryAlerts ?? this.entryAlerts,
+      exitAlerts: exitAlerts ?? this.exitAlerts,
       watchlistSymbols: watchlistSymbols ?? this.watchlistSymbols,
     );
   }
@@ -91,6 +96,8 @@ class _MainNavScreenState extends State<MainNavScreen> {
   Timer? _priceFlushTimer;
   StreamSubscription<PriceUpdate>? _priceSub;
   final Map<String, PriceUpdate> _pendingPriceUpdates = {};
+  Map<String, String> _signalActionStatuses = {};
+  final Set<String> _submittingSignalIds = <String>{};
   bool _refreshInFlight = false;
   bool _refreshQueued = false;
 
@@ -98,6 +105,7 @@ class _MainNavScreenState extends State<MainNavScreen> {
   void initState() {
     super.initState();
     unawaited(_notifications.requestPermissions());
+    unawaited(_loadSignalActionStatuses());
     _loadFull();
     _fullRefreshTimer = Timer.periodic(
       _fullRefreshInterval,
@@ -113,6 +121,96 @@ class _MainNavScreenState extends State<MainNavScreen> {
     _priceSub?.cancel();
     _realtime.disconnect();
     super.dispose();
+  }
+
+  Future<void> _loadSignalActionStatuses() async {
+    final cached = await _history.loadSignalActionStatuses();
+    if (!mounted) return;
+    setState(() {
+      _signalActionStatuses = cached;
+    });
+  }
+
+  String _signalIdFor(EntryAlertSignal signal, String signalType) {
+    return buildSignalActionSignalId(
+      signal: signal,
+      signalType: signalType,
+      at: _state.updatedAt,
+    );
+  }
+
+  String? _signalActionStatusOf(EntryAlertSignal signal, String signalType) {
+    return _signalActionStatuses[_signalIdFor(signal, signalType)];
+  }
+
+  bool _isSignalActionSubmitting(EntryAlertSignal signal, String signalType) {
+    return _submittingSignalIds.contains(_signalIdFor(signal, signalType));
+  }
+
+  Future<void> _submitSignalAction(
+    EntryAlertSignal signal,
+    String signalType,
+    String actionType,
+  ) async {
+    final signalId = _signalIdFor(signal, signalType);
+    if (_submittingSignalIds.contains(signalId)) return;
+
+    final existingAction = _signalActionStatuses[signalId];
+    if (existingAction == actionType) {
+      _showSignalActionMessage(buildSignalActionStatusLabel(actionType));
+      return;
+    }
+
+    if (!_backendApi.isConfigured) {
+      _showSignalActionMessage('当前未连接后台，暂时无法回传统计');
+      return;
+    }
+
+    setState(() {
+      _submittingSignalIds.add(signalId);
+    });
+
+    try {
+      final result = await _backendApi.submitSignalAction(
+        signalId: signalId,
+        symbol: normalizeSignalActionSymbol(signal.symbol),
+        signalType: signalType,
+        signalSource: 'feishu',
+        actionType: actionType,
+        price: signal.currentPrice,
+        timingLabel: signal.timingLabel,
+        timingReason: signal.timingReason,
+        totalScore: signal.totalScore,
+        entryScore: signal.entryScore,
+      );
+
+      final nextStatuses = Map<String, String>.from(_signalActionStatuses)
+        ..[signalId] = actionType;
+      await _history.saveSignalActionStatuses(nextStatuses);
+
+      if (!mounted) return;
+      setState(() {
+        _signalActionStatuses = nextStatuses;
+      });
+      _showSignalActionMessage(
+        result.created ? '已记录到后台统计' : '这条信号今天已经记录过了',
+      );
+    } catch (error) {
+      _showSignalActionMessage('记录失败：$error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _submittingSignalIds.remove(signalId);
+        });
+      }
+    }
+  }
+
+  void _showSignalActionMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   Future<void> _loadFull({bool silent = false}) async {
@@ -151,6 +249,7 @@ class _MainNavScreenState extends State<MainNavScreen> {
           error: null,
           engineReport: snapshot.engineReport,
           entryAlerts: snapshot.entryAlerts,
+          exitAlerts: snapshot.exitAlerts,
           watchlistSymbols: snapshot.watchlistSymbols,
         );
       });
@@ -316,6 +415,9 @@ class _MainNavScreenState extends State<MainNavScreen> {
       PicksScreen(
         state: _state,
         onRefresh: _loadFull,
+        onSignalAction: _submitSignalAction,
+        resolveSignalActionStatus: _signalActionStatusOf,
+        isSignalActionSubmitting: _isSignalActionSubmitting,
       ),
       MarketScreen(
         state: _state,

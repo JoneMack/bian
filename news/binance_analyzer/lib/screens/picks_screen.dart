@@ -1,18 +1,42 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../models/coin_data.dart';
+import '../models/strategy_snapshot.dart';
 import '../theme/app_theme.dart';
+import '../utils/signal_action_helper.dart';
 import 'main_nav_screen.dart';
+
+typedef SignalActionHandler = Future<void> Function(
+  EntryAlertSignal signal,
+  String signalType,
+  String actionType,
+);
+
+typedef SignalActionStatusResolver = String? Function(
+  EntryAlertSignal signal,
+  String signalType,
+);
+
+typedef SignalActionSubmittingResolver = bool Function(
+  EntryAlertSignal signal,
+  String signalType,
+);
 
 /// 今日精选 3 个 —— 首页 Tab
 class PicksScreen extends StatelessWidget {
   final MarketState state;
   final Future<void> Function({bool silent}) onRefresh;
+  final SignalActionHandler onSignalAction;
+  final SignalActionStatusResolver resolveSignalActionStatus;
+  final SignalActionSubmittingResolver isSignalActionSubmitting;
 
   const PicksScreen({
     super.key,
     required this.state,
     required this.onRefresh,
+    required this.onSignalAction,
+    required this.resolveSignalActionStatus,
+    required this.isSignalActionSubmitting,
   });
 
   @override
@@ -30,11 +54,12 @@ class PicksScreen extends StatelessWidget {
               const SliverFillRemaining(child: _LoadingView())
             else if (state.error != null)
               SliverFillRemaining(
-                child: _ErrorView(
-                    error: state.error!, onRetry: () => onRefresh()),
+                child:
+                    _ErrorView(error: state.error!, onRetry: () => onRefresh()),
               )
             else ...[
               SliverToBoxAdapter(child: _buildMarketMood()),
+              SliverToBoxAdapter(child: _buildSignalActionSection()),
               SliverToBoxAdapter(child: _buildTop3Section()),
               SliverToBoxAdapter(child: _buildFooter()),
             ],
@@ -76,8 +101,8 @@ class PicksScreen extends StatelessWidget {
                       fontSize: 18,
                       fontWeight: FontWeight.bold)),
               Text('AI 智能推荐 · 每日3个',
-                  style: TextStyle(
-                      color: AppTheme.textSecondary, fontSize: 11)),
+                  style:
+                      TextStyle(color: AppTheme.textSecondary, fontSize: 11)),
             ],
           ),
         ],
@@ -103,8 +128,7 @@ class PicksScreen extends StatelessWidget {
                   child: CircularProgressIndicator(
                       strokeWidth: 2, color: AppTheme.binanceYellow),
                 )
-              : const Icon(Icons.refresh_rounded,
-                  color: AppTheme.textPrimary),
+              : const Icon(Icons.refresh_rounded, color: AppTheme.textPrimary),
         ),
       ],
     );
@@ -130,8 +154,7 @@ class PicksScreen extends StatelessWidget {
       decoration: BoxDecoration(
         color: AppTheme.cardDark,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-            color: mood.$2.withAlpha(80), width: 1),
+        border: Border.all(color: mood.$2.withAlpha(80), width: 1),
       ),
       child: Row(
         children: [
@@ -165,11 +188,96 @@ class PicksScreen extends StatelessWidget {
                 ),
               ),
               const Text('平均涨幅',
-                  style: TextStyle(
-                      color: AppTheme.textSecondary, fontSize: 11)),
+                  style:
+                      TextStyle(color: AppTheme.textSecondary, fontSize: 11)),
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildSignalActionSection() {
+    final buySignals =
+        state.entryAlerts.where((item) => item.shouldNotify).take(3).toList();
+    final sellSignals =
+        state.exitAlerts.where((item) => item.shouldNotify).take(3).toList();
+
+    if (buySignals.isEmpty && sellSignals.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: AppTheme.cardDark,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: AppTheme.binanceYellow.withAlpha(50),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(
+                  Icons.notifications_active_rounded,
+                  color: AppTheme.binanceYellow,
+                  size: 18,
+                ),
+                SizedBox(width: 8),
+                Text(
+                  '飞书信号待处理',
+                  style: TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '买入点确定，卖出点取消，动作会同步回后台做执行统计。',
+              style: TextStyle(
+                color: AppTheme.textSecondary,
+                fontSize: 11,
+              ),
+            ),
+            const SizedBox(height: 12),
+            ...buySignals.map(
+              (signal) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _SignalActionTile(
+                  signal: signal,
+                  signalType: 'buy',
+                  actionText: '确定',
+                  accentColor: AppTheme.green,
+                  actionStatus: resolveSignalActionStatus(signal, 'buy'),
+                  submitting: isSignalActionSubmitting(signal, 'buy'),
+                  onPressed: () => onSignalAction(signal, 'buy', 'confirm'),
+                ),
+              ),
+            ),
+            ...sellSignals.map(
+              (signal) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _SignalActionTile(
+                  signal: signal,
+                  signalType: 'sell',
+                  actionText: '取消',
+                  accentColor: AppTheme.red,
+                  actionStatus: resolveSignalActionStatus(signal, 'sell'),
+                  submitting: isSignalActionSubmitting(signal, 'sell'),
+                  onPressed: () => onSignalAction(signal, 'sell', 'cancel'),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -199,8 +307,7 @@ class PicksScreen extends StatelessWidget {
                       fontWeight: FontWeight.bold)),
               const SizedBox(width: 8),
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
                     color: AppTheme.binanceYellow.withAlpha(40),
                     borderRadius: BorderRadius.circular(10)),
@@ -232,8 +339,7 @@ class PicksScreen extends StatelessWidget {
 
           // 风险提示
           Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
               color: AppTheme.binanceYellow.withAlpha(20),
               borderRadius: BorderRadius.circular(10),
@@ -248,8 +354,8 @@ class PicksScreen extends StatelessWidget {
                 Expanded(
                   child: Text(
                     '推荐仅供参考，基于实时行情评分分析。加密市场风险极高，请做好仓位管理。',
-                    style: TextStyle(
-                        color: AppTheme.textSecondary, fontSize: 11),
+                    style:
+                        TextStyle(color: AppTheme.textSecondary, fontSize: 11),
                   ),
                 ),
               ],
@@ -301,8 +407,8 @@ class _AlgoRow extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text('• $label',
-              style: const TextStyle(
-                  color: AppTheme.binanceYellow, fontSize: 12)),
+              style:
+                  const TextStyle(color: AppTheme.binanceYellow, fontSize: 12)),
           const SizedBox(width: 4),
           Expanded(
             child: Text(desc,
@@ -312,6 +418,164 @@ class _AlgoRow extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+class _SignalActionTile extends StatelessWidget {
+  final EntryAlertSignal signal;
+  final String signalType;
+  final String actionText;
+  final Color accentColor;
+  final String? actionStatus;
+  final bool submitting;
+  final VoidCallback onPressed;
+
+  const _SignalActionTile({
+    required this.signal,
+    required this.signalType,
+    required this.actionText,
+    required this.accentColor,
+    required this.actionStatus,
+    required this.submitting,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final statusText = actionStatus == null
+        ? null
+        : buildSignalActionStatusLabel(actionStatus!);
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppTheme.cardLight,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: accentColor.withAlpha(70)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      normalizeSignalActionSymbol(signal.symbol),
+                      style: const TextStyle(
+                        color: AppTheme.textPrimary,
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: accentColor.withAlpha(35),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        signalType == 'sell' ? '卖出' : '买入',
+                        style: TextStyle(
+                          color: accentColor,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        signal.timingLabel,
+                        style: const TextStyle(
+                          color: AppTheme.textSecondary,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  signal.timingReason,
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 11,
+                    height: 1.35,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '参考价 ${_formatActionPrice(signal.currentPrice)}  ·  综合 ${(signal.totalScore * 100).round()} 分',
+                  style: const TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          if (submitting)
+            SizedBox(
+              width: 30,
+              height: 30,
+              child: CircularProgressIndicator(
+                strokeWidth: 2.2,
+                color: accentColor,
+                backgroundColor: accentColor.withAlpha(30),
+              ),
+            )
+          else if (statusText != null)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: accentColor.withAlpha(22),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                statusText,
+                style: TextStyle(
+                  color: accentColor,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            )
+          else
+            FilledButton(
+              onPressed: onPressed,
+              style: FilledButton.styleFrom(
+                backgroundColor: accentColor,
+                foregroundColor: Colors.white,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              child: Text(
+                actionText,
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  String _formatActionPrice(double price) {
+    if (price >= 1000) return price.toStringAsFixed(2);
+    if (price >= 1) return price.toStringAsFixed(4);
+    if (price >= 0.01) return price.toStringAsFixed(5);
+    return price.toStringAsFixed(7);
   }
 }
 
@@ -329,7 +593,11 @@ class _BigPickCard extends StatelessWidget {
           ? AppTheme.buyColor
           : AppTheme.holdColor;
 
-  String get _rankLabel => rank == 1 ? '🥇 首选' : rank == 2 ? '🥈 次选' : '🥉 备选';
+  String get _rankLabel => rank == 1
+      ? '🥇 首选'
+      : rank == 2
+          ? '🥈 次选'
+          : '🥉 备选';
 
   @override
   Widget build(BuildContext context) {
@@ -361,8 +629,8 @@ class _BigPickCard extends StatelessWidget {
                         fontWeight: FontWeight.bold)),
                 const Spacer(),
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 10, vertical: 3),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                   decoration: BoxDecoration(
                     color: _accentColor.withAlpha(50),
                     borderRadius: BorderRadius.circular(20),
@@ -433,9 +701,7 @@ class _BigPickCard extends StatelessWidget {
                               Text(
                                 '${isUp ? '+' : ''}${chg.toStringAsFixed(2)}%',
                                 style: TextStyle(
-                                    color: isUp
-                                        ? AppTheme.green
-                                        : AppTheme.red,
+                                    color: isUp ? AppTheme.green : AppTheme.red,
                                     fontSize: 14,
                                     fontWeight: FontWeight.bold),
                               ),
@@ -492,8 +758,7 @@ class _BigPickCard extends StatelessWidget {
                         child: LinearProgressIndicator(
                           value: coin.score,
                           minHeight: 8,
-                          backgroundColor:
-                              _accentColor.withAlpha(40),
+                          backgroundColor: _accentColor.withAlpha(40),
                           valueColor:
                               AlwaysStoppedAnimation<Color>(_accentColor),
                         ),
@@ -560,8 +825,7 @@ class _Metric extends StatelessWidget {
   Widget build(BuildContext context) {
     return Expanded(
       child: Container(
-        padding:
-            const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         decoration: BoxDecoration(
           color: AppTheme.cardLight,
           borderRadius: BorderRadius.circular(8),
@@ -575,9 +839,7 @@ class _Metric extends StatelessWidget {
             const SizedBox(height: 2),
             Text(value,
                 style: TextStyle(
-                    color: color,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold)),
+                    color: color, fontSize: 12, fontWeight: FontWeight.bold)),
           ],
         ),
       ),
@@ -609,8 +871,7 @@ class _RangeBarFull extends StatelessWidget {
               ),
               if (w > 12)
                 Positioned(
-                  left: (w * position.clamp(0.0, 1.0) - 6)
-                      .clamp(0.0, w - 12),
+                  left: (w * position.clamp(0.0, 1.0) - 6).clamp(0.0, w - 12),
                   top: -3,
                   child: Container(
                     width: 12,
@@ -618,12 +879,10 @@ class _RangeBarFull extends StatelessWidget {
                     decoration: BoxDecoration(
                       color: Colors.white,
                       shape: BoxShape.circle,
-                      border: Border.all(
-                          color: AppTheme.cardDark, width: 2),
+                      border: Border.all(color: AppTheme.cardDark, width: 2),
                       boxShadow: [
                         BoxShadow(
-                            color: Colors.black.withAlpha(80),
-                            blurRadius: 4)
+                            color: Colors.black.withAlpha(80), blurRadius: 4)
                       ],
                     ),
                   ),
@@ -634,11 +893,13 @@ class _RangeBarFull extends StatelessWidget {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text('最低', style: TextStyle(color: AppTheme.red, fontSize: 10)),
-              Text(
-                  '当前位置 ${(position * 100).toInt()}%',
-                  style: const TextStyle(color: AppTheme.textSecondary, fontSize: 10)),
-              const Text('最高', style: TextStyle(color: AppTheme.green, fontSize: 10)),
+              const Text('最低',
+                  style: TextStyle(color: AppTheme.red, fontSize: 10)),
+              Text('当前位置 ${(position * 100).toInt()}%',
+                  style: const TextStyle(
+                      color: AppTheme.textSecondary, fontSize: 10)),
+              const Text('最高',
+                  style: TextStyle(color: AppTheme.green, fontSize: 10)),
             ],
           ),
         ],
@@ -653,17 +914,18 @@ class _EmptyPicksCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
-          color: AppTheme.cardDark,
-          borderRadius: BorderRadius.circular(14)),
+          color: AppTheme.cardDark, borderRadius: BorderRadius.circular(14)),
       child: const Column(
         children: [
-          Icon(Icons.sentiment_neutral, color: AppTheme.textSecondary, size: 40),
+          Icon(Icons.sentiment_neutral,
+              color: AppTheme.textSecondary, size: 40),
           SizedBox(height: 12),
           Text('今日市场整体偏弱，暂无强烈推荐',
               style: TextStyle(color: AppTheme.textSecondary, fontSize: 14),
               textAlign: TextAlign.center),
           SizedBox(height: 6),
-          Text('建议观望或轻仓操作', style: TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
+          Text('建议观望或轻仓操作',
+              style: TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
         ],
       ),
     );

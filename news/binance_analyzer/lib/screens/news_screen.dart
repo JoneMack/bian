@@ -550,7 +550,7 @@ Future<void> _copyNewsBrief(BuildContext context, NewsItem item) async {
   if (context.mounted) {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('资讯摘要已复制'),
+        content: Text('资讯内容已复制'),
         backgroundColor: AppTheme.cardLight,
         duration: Duration(seconds: 1),
       ),
@@ -676,7 +676,7 @@ class _NewsDetailSheet extends StatelessWidget {
                     ],
                     const SizedBox(height: 18),
                     const Text(
-                      '中文简报',
+                      '中文内容',
                       style: TextStyle(
                         color: AppTheme.textPrimary,
                         fontSize: 14,
@@ -709,7 +709,7 @@ class _NewsDetailSheet extends StatelessWidget {
                             onPressed: () => _copyNewsBrief(context, item),
                             icon: const Icon(Icons.content_copy_rounded,
                                 size: 16),
-                            label: const Text('复制摘要'),
+                            label: const Text('复制内容'),
                             style: OutlinedButton.styleFrom(
                               foregroundColor: AppTheme.textPrimary,
                               side: const BorderSide(color: AppTheme.cardLight),

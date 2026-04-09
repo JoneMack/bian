@@ -11,6 +11,7 @@ class HistoryService {
   static const _key = 'daily_recommendations_v2';
   static const _replayKey = 'hourly_replay_report_v1';
   static const _policyKey = 'entry_signal_policy_v1';
+  static const _signalActionStatusKey = 'signal_action_status_v1';
 
   // ── 读取历史 ──────────────────────────────────────
   Future<List<DailyRecommendation>> loadHistory() async {
@@ -294,9 +295,38 @@ class HistoryService {
     }
   }
 
+  Future<Map<String, String>> loadSignalActionStatuses() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_signalActionStatusKey);
+    if (raw == null || raw.isEmpty) return <String, String>{};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return <String, String>{};
+      return decoded.map(
+        (key, value) => MapEntry(key.toString(), value.toString()),
+      );
+    } catch (_) {
+      return <String, String>{};
+    }
+  }
+
+  Future<void> saveSignalActionStatuses(Map<String, String> statuses) async {
+    final prefs = await SharedPreferences.getInstance();
+    final trimmed = statuses.entries
+        .where((entry) => entry.key.trim().isNotEmpty)
+        .map((entry) => MapEntry(entry.key.trim(), entry.value.trim()))
+        .toList();
+    final limited = <String, String>{};
+    for (final entry in trimmed.take(300)) {
+      limited[entry.key] = entry.value;
+    }
+    await prefs.setString(_signalActionStatusKey, jsonEncode(limited));
+  }
+
   static DateTime _dateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
 
-  String _pickKey(PickRecord pick) => '${pick.signalSource}:${pick.signalType}:${pick.symbol}';
+  String _pickKey(PickRecord pick) =>
+      '${pick.signalSource}:${pick.signalType}:${pick.symbol}';
 
   List<PickRecord> _buildFeishuSignalPicks({
     required List<EntryAlertSignal> entryAlerts,
@@ -307,7 +337,8 @@ class HistoryService {
     final picks = <PickRecord>[];
     final bySymbol = {for (final coin in marketCoins) coin.displayName: coin};
 
-    for (final alert in entryAlerts.where((item) => item.shouldNotify).take(3)) {
+    for (final alert
+        in entryAlerts.where((item) => item.shouldNotify).take(3)) {
       final coin = bySymbol[alert.symbol];
       picks.add(
         PickRecord(

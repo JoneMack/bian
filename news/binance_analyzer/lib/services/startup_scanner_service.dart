@@ -47,6 +47,16 @@ class StartupScannerService {
         universeSize: currentCoins.length,
         analyzedSymbols: 0,
         strategyLabel: policy.label,
+        marketRegime: const StartupMarketRegime(
+          allowEntries: false,
+          status: 'neutral',
+          reason: '历史数据不足，暂不出手。',
+          marketTrendBreadth: 0,
+          marketMomentumBreadth: 0,
+          marketVolumeBreadth: 0,
+          redBreadth: 0,
+          deepRedBreadth: 0,
+        ),
         candidates: const [],
         notes: '可用于启动扫描的币种不足，可能是历史 K 线样本不够。',
       );
@@ -68,6 +78,32 @@ class StartupScannerService {
     final marketMomentumBreadth =
         profiles.where((profile) => profile.momentum7 > 0).length /
             profiles.length;
+    final marketVolumeBreadth = profiles
+            .where(
+                (profile) => profile.volumeRatio >= policy.minWatchVolumeRatio)
+            .length /
+        profiles.length;
+    final redBreadth = profiles
+            .where((profile) => profile.coin.priceChangePercent < 0)
+            .length /
+        profiles.length;
+    final deepRedBreadth = profiles
+            .where((profile) => profile.coin.priceChangePercent <= -3.0)
+            .length /
+        profiles.length;
+    final benchmarkContext = _buildBenchmarkContext(
+      dailyHistory: closedDaily,
+      hourlyHistory: closedHourly,
+    );
+    final marketRegime = _buildMarketRegime(
+      marketTrendBreadth: marketTrendBreadth,
+      marketMomentumBreadth: marketMomentumBreadth,
+      marketVolumeBreadth: marketVolumeBreadth,
+      redBreadth: redBreadth,
+      deepRedBreadth: deepRedBreadth,
+      benchmarkContext: benchmarkContext,
+      policy: policy,
+    );
 
     final candidates = profiles
         .map(
@@ -77,6 +113,7 @@ class StartupScannerService {
             momentumRank: momentumRanks[profile.symbol] ?? 0,
             marketTrendBreadth: marketTrendBreadth,
             marketMomentumBreadth: marketMomentumBreadth,
+            marketRegime: marketRegime,
             policy: policy,
           ),
         )
@@ -85,21 +122,34 @@ class StartupScannerService {
         final byNotify =
             (b.shouldNotify ? 1 : 0).compareTo(a.shouldNotify ? 1 : 0);
         if (byNotify != 0) return byNotify;
+        final byWatch =
+            (b.shouldWatch ? 1 : 0).compareTo(a.shouldWatch ? 1 : 0);
+        if (byWatch != 0) return byWatch;
         final byScore = b.score.compareTo(a.score);
         if (byScore != 0) return byScore;
         return b.volumeRatio.compareTo(a.volumeRatio);
       });
 
     final actionable = candidates.where((item) => item.shouldNotify).length;
+    final watchCount =
+        candidates.where((item) => item.signalStage == 'watch').length;
+    final blockedCount = candidates
+        .where((item) => item.signalStage == 'blocked_by_market')
+        .length;
     final notes = actionable > 0
-        ? '当前共发现 $actionable 个满足启动阈值的币，已按总分和量能排序。'
-        : '当前没有满足启动阈值的币，建议继续等待放量突破。';
+        ? '当前共发现 $actionable 个满足正式买入阈值的币，已按总分和量能排序。'
+        : watchCount > 0
+            ? '当前有 $watchCount 个币进入观察区，建议等待下一轮确认后再买。'
+            : blockedCount > 0
+                ? '存在 $blockedCount 个候选币，但全局市场过滤器建议空仓等待。'
+                : '当前没有满足启动阈值的币，建议继续等待放量突破。';
 
     return StartupScanReport(
       generatedAt: DateTime.now(),
       universeSize: currentCoins.length,
       analyzedSymbols: profiles.length,
       strategyLabel: policy.label,
+      marketRegime: marketRegime,
       candidates: candidates,
       notes: notes,
     );
@@ -195,6 +245,7 @@ class StartupScannerService {
     required double momentumRank,
     required double marketTrendBreadth,
     required double marketMomentumBreadth,
+    required StartupMarketRegime marketRegime,
     required StartupScanPolicy policy,
   }) {
     final price = profile.coin.lastPrice;
@@ -225,6 +276,11 @@ class StartupScannerService {
             _sweetSpot(profile.momentum30, 10, 16) * 0.2 +
             dailyChangeScore * 0.1)
         .clamp(0.0, 1.0);
+    final confirmationScore = (trendScore * 0.36 +
+            breakoutScore * 0.28 +
+            volumeScore * 0.22 +
+            marketScore * 0.14)
+        .clamp(0.0, 1.0);
 
     final overextendedPenalty = profile.momentum30 > 36 ||
             profile.coin.priceChangePercent > 8.6 ||
@@ -246,7 +302,26 @@ class StartupScannerService {
             overextendedPenalty)
         .clamp(0.0, 1.0);
 
-    final shouldNotify = score >= policy.minScore &&
+    final shouldWatch = score >= policy.minWatchScore &&
+        trendScore >= policy.minWatchTrendScore &&
+        compressionScore >= policy.minWatchCompressionScore &&
+        liquidityRank >= policy.minWatchLiquidityScore &&
+        momentumScore >= policy.minWatchMomentumScore &&
+        profile.volumeRatio >= policy.minWatchVolumeRatio &&
+        profile.coin.quoteVolume >= policy.minWatchQuoteVolume &&
+        profile.coin.count >= policy.minWatchTradeCount &&
+        profile.dailyBreakoutDistance >= policy.minWatchBreakoutDistance &&
+        profile.dailyBreakoutDistance <= policy.maxWatchBreakoutDistance &&
+        profile.hourlyBreakoutDistance >=
+            policy.minWatchHourlyBreakoutDistance &&
+        profile.hourlyBreakoutDistance <=
+            policy.maxWatchHourlyBreakoutDistance &&
+        profile.nearTermPivotDistance >= policy.minWatchNearTermPivotDistance &&
+        profile.nearTermPivotDistance <= policy.maxWatchNearTermPivotDistance &&
+        profile.momentum30 <= policy.maxThirtyDayMomentum &&
+        profile.coin.priceChangePercent <= policy.maxDailyChangePercent;
+
+    final rawShouldNotify = score >= policy.minScore &&
         trendScore >= policy.minTrendScore &&
         compressionScore >= policy.minCompressionScore &&
         liquidityRank >= policy.minLiquidityScore &&
@@ -265,6 +340,15 @@ class StartupScannerService {
         profile.nearTermPivotDistance <= policy.maxNearTermPivotDistance &&
         profile.momentum30 <= policy.maxThirtyDayMomentum &&
         profile.coin.priceChangePercent <= policy.maxDailyChangePercent;
+    final blockedByMarket = !marketRegime.allowEntries && shouldWatch;
+    final shouldNotify = rawShouldNotify && marketRegime.allowEntries;
+    final signalStage = shouldNotify
+        ? 'buy'
+        : blockedByMarket
+            ? 'blocked_by_market'
+            : shouldWatch
+                ? 'watch'
+                : 'ignore';
 
     final reasonParts = <String>[
       '24h额 ${_compactUsd(profile.coin.quoteVolume)}',
@@ -293,6 +377,8 @@ class StartupScannerService {
       symbol: profile.symbol,
       currentPrice: profile.coin.lastPrice,
       score: score,
+      setupScore: score,
+      confirmationScore: confirmationScore,
       trendScore: trendScore,
       compressionScore: compressionScore,
       momentumScore: momentumScore,
@@ -306,7 +392,136 @@ class StartupScannerService {
       sevenDayMomentum: profile.momentum7,
       thirtyDayMomentum: profile.momentum30,
       reason: reasonParts.join('；'),
+      signalStage: signalStage,
+      shouldWatch: shouldWatch,
+      blockedByMarket: blockedByMarket,
       shouldNotify: shouldNotify,
+    );
+  }
+
+  StartupMarketRegime _buildMarketRegime({
+    required double marketTrendBreadth,
+    required double marketMomentumBreadth,
+    required double marketVolumeBreadth,
+    required double redBreadth,
+    required double deepRedBreadth,
+    required _BenchmarkContext benchmarkContext,
+    required StartupScanPolicy policy,
+  }) {
+    final breadthAllows =
+        marketTrendBreadth >= policy.minMarketTrendBreadthForEntry &&
+            marketMomentumBreadth >= policy.minMarketMomentumBreadthForEntry &&
+            marketVolumeBreadth >= policy.minMarketVolumeBreadthForEntry &&
+            redBreadth <= policy.maxRedBreadthForEntry &&
+            deepRedBreadth <= policy.maxDeepRedBreadthForEntry;
+    final benchmarkAllows =
+        !benchmarkContext.available || benchmarkContext.score >= 0.56;
+    final allowEntries = breadthAllows && benchmarkAllows;
+
+    final status = allowEntries
+        ? 'risk_on'
+        : benchmarkContext.available && !benchmarkAllows
+            ? 'risk_off'
+            : redBreadth > policy.maxRedBreadthForEntry ||
+                    deepRedBreadth > policy.maxDeepRedBreadthForEntry
+                ? 'risk_off'
+                : 'neutral';
+
+    final reason = allowEntries
+        ? '市场环境允许试仓，启动信号可继续跟踪确认。'
+        : benchmarkContext.available && !benchmarkAllows
+            ? benchmarkContext.reason
+            : redBreadth > policy.maxRedBreadthForEntry ||
+                    deepRedBreadth > policy.maxDeepRedBreadthForEntry
+                ? '全市场下跌广度偏大，先空仓等待更稳。'
+                : '市场趋势和量能尚未同步，先观察不追。';
+
+    return StartupMarketRegime(
+      allowEntries: allowEntries,
+      status: status,
+      reason: reason,
+      marketTrendBreadth: marketTrendBreadth,
+      marketMomentumBreadth: marketMomentumBreadth,
+      marketVolumeBreadth: marketVolumeBreadth,
+      redBreadth: redBreadth,
+      deepRedBreadth: deepRedBreadth,
+      benchmarkStatus:
+          benchmarkContext.available ? benchmarkContext.status : 'unavailable',
+      benchmarkScore: benchmarkContext.score,
+      benchmarkReason: benchmarkContext.reason,
+      btcDailyTrend: benchmarkContext.btcDailyTrend,
+      btcHourlyTrend: benchmarkContext.btcHourlyTrend,
+      ethDailyTrend: benchmarkContext.ethDailyTrend,
+      ethHourlyTrend: benchmarkContext.ethHourlyTrend,
+    );
+  }
+
+  _BenchmarkContext _buildBenchmarkContext({
+    required Map<String, List<Kline>> dailyHistory,
+    required Map<String, List<Kline>> hourlyHistory,
+  }) {
+    _BenchmarkSnapshot? assetSnapshot(String symbol) {
+      final dailyBars = _sorted(dailyHistory[symbol] ?? const []);
+      final hourlyBars = _sorted(hourlyHistory[symbol] ?? const []);
+      if (dailyBars.length < 50 || hourlyBars.length < 21) {
+        return null;
+      }
+
+      final dailyCloses = dailyBars.map((bar) => bar.close).toList();
+      final hourlyCloses = hourlyBars.map((bar) => bar.close).toList();
+      final dailyLast = dailyCloses.last;
+      final hourlyLast = hourlyCloses.last;
+      final sma20 = _average(dailyCloses.sublist(dailyCloses.length - 20));
+      final sma50 = _average(dailyCloses.sublist(dailyCloses.length - 50));
+      final hourlySma8 =
+          _average(hourlyCloses.sublist(hourlyCloses.length - 8));
+      final hourlySma21 =
+          _average(hourlyCloses.sublist(hourlyCloses.length - 21));
+
+      final dailyTrend = ((dailyLast > sma20 ? 1.0 : 0.12) * 0.58 +
+              (sma20 > sma50 ? 1.0 : 0.18) * 0.42)
+          .clamp(0.0, 1.0);
+      final hourlyTrend = ((hourlyLast > hourlySma8 ? 1.0 : 0.16) * 0.55 +
+              (hourlySma8 > hourlySma21 ? 1.0 : 0.2) * 0.45)
+          .clamp(0.0, 1.0);
+      return _BenchmarkSnapshot(
+        symbol: symbol,
+        score: (dailyTrend * 0.62 + hourlyTrend * 0.38).clamp(0.0, 1.0),
+        dailyTrend: dailyTrend,
+        hourlyTrend: hourlyTrend,
+      );
+    }
+
+    final btc = assetSnapshot('BTCUSDT');
+    final eth = assetSnapshot('ETHUSDT');
+    final availableBenchmarks =
+        [btc, eth].whereType<_BenchmarkSnapshot>().toList();
+    if (availableBenchmarks.isEmpty) {
+      return const _BenchmarkContext.unavailable();
+    }
+
+    final score =
+        _average(availableBenchmarks.map((item) => item.score).toList());
+    final status = score >= 0.64
+        ? 'aligned'
+        : score >= 0.56
+            ? 'mixed'
+            : 'weak';
+    final reason = status == 'aligned'
+        ? 'BTC/ETH 结构同步偏强，大盘允许继续观察启动信号。'
+        : status == 'mixed'
+            ? 'BTC/ETH 结构分化，允许轻仓试错但不宜激进追高。'
+            : 'BTC/ETH 主趋势未确认，先减少山寨启动交易，等待大盘结构修复。';
+
+    return _BenchmarkContext(
+      available: true,
+      score: score,
+      status: status,
+      reason: reason,
+      btcDailyTrend: btc?.dailyTrend ?? 0.0,
+      btcHourlyTrend: btc?.hourlyTrend ?? 0.0,
+      ethDailyTrend: eth?.dailyTrend ?? 0.0,
+      ethHourlyTrend: eth?.hourlyTrend ?? 0.0,
     );
   }
 
@@ -394,7 +609,29 @@ class StartupScanPolicy {
   final double maxDailyChangePercent;
   final double minQuoteVolume;
   final int minTradeCount;
+  final double minWatchScore;
+  final double minWatchTrendScore;
+  final double minWatchCompressionScore;
+  final double minWatchLiquidityScore;
+  final double minWatchMomentumScore;
+  final double minWatchVolumeRatio;
+  final double minWatchBreakoutDistance;
+  final double maxWatchBreakoutDistance;
+  final double minWatchHourlyBreakoutDistance;
+  final double maxWatchHourlyBreakoutDistance;
+  final double minWatchNearTermPivotDistance;
+  final double maxWatchNearTermPivotDistance;
+  final double minWatchQuoteVolume;
+  final int minWatchTradeCount;
+  final double minMarketTrendBreadthForEntry;
+  final double minMarketMomentumBreadthForEntry;
+  final double minMarketVolumeBreadthForEntry;
+  final double maxRedBreadthForEntry;
+  final double maxDeepRedBreadthForEntry;
   final int maxPushCandidates;
+  final int maxObservationCandidates;
+  final int observationCooldownHours;
+  final int confirmationWindowHours;
   final int cooldownHours;
 
   static const StartupScanPolicy defaultPolicy = StartupScanPolicy(
@@ -418,7 +655,29 @@ class StartupScanPolicy {
     maxDailyChangePercent: 9,
     minQuoteVolume: 3000000,
     minTradeCount: 6000,
+    minWatchScore: 0.67,
+    minWatchTrendScore: 0.58,
+    minWatchCompressionScore: 0.18,
+    minWatchLiquidityScore: 0.14,
+    minWatchMomentumScore: 0.20,
+    minWatchVolumeRatio: 1.15,
+    minWatchBreakoutDistance: -2.2,
+    maxWatchBreakoutDistance: 2.8,
+    minWatchHourlyBreakoutDistance: -1.8,
+    maxWatchHourlyBreakoutDistance: 2.6,
+    minWatchNearTermPivotDistance: -1.3,
+    maxWatchNearTermPivotDistance: 2.0,
+    minWatchQuoteVolume: 1800000,
+    minWatchTradeCount: 3200,
+    minMarketTrendBreadthForEntry: 0.52,
+    minMarketMomentumBreadthForEntry: 0.45,
+    minMarketVolumeBreadthForEntry: 0.30,
+    maxRedBreadthForEntry: 0.58,
+    maxDeepRedBreadthForEntry: 0.26,
     maxPushCandidates: 2,
+    maxObservationCandidates: 3,
+    observationCooldownHours: 2,
+    confirmationWindowHours: 4,
     cooldownHours: 10,
   );
 
@@ -443,18 +702,43 @@ class StartupScanPolicy {
     required this.maxDailyChangePercent,
     required this.minQuoteVolume,
     required this.minTradeCount,
+    required this.minWatchScore,
+    required this.minWatchTrendScore,
+    required this.minWatchCompressionScore,
+    required this.minWatchLiquidityScore,
+    required this.minWatchMomentumScore,
+    required this.minWatchVolumeRatio,
+    required this.minWatchBreakoutDistance,
+    required this.maxWatchBreakoutDistance,
+    required this.minWatchHourlyBreakoutDistance,
+    required this.maxWatchHourlyBreakoutDistance,
+    required this.minWatchNearTermPivotDistance,
+    required this.maxWatchNearTermPivotDistance,
+    required this.minWatchQuoteVolume,
+    required this.minWatchTradeCount,
+    required this.minMarketTrendBreadthForEntry,
+    required this.minMarketMomentumBreadthForEntry,
+    required this.minMarketVolumeBreadthForEntry,
+    required this.maxRedBreadthForEntry,
+    required this.maxDeepRedBreadthForEntry,
     required this.maxPushCandidates,
+    required this.maxObservationCandidates,
+    required this.observationCooldownHours,
+    required this.confirmationWindowHours,
     required this.cooldownHours,
   });
 
   String get summary => 'score>=${(minScore * 100).round()} '
+      '| watch>=${(minWatchScore * 100).round()} '
       '| trend>=${(minTrendScore * 100).round()} '
       '| compression>=${(minCompressionScore * 100).round()} '
       '| liquidity>=${(minLiquidityScore * 100).round()} '
       '| momentum>=${(minMomentumScore * 100).round()} '
-      '| marketTrend>=${(minMarketTrendBreadth * 100).round()} '
-      '| marketMomentum>=${(minMarketMomentumBreadth * 100).round()} '
+      '| marketTrend>=${(minMarketTrendBreadthForEntry * 100).round()} '
+      '| marketMomentum>=${(minMarketMomentumBreadthForEntry * 100).round()} '
       '| volume>=${minVolumeRatio.toStringAsFixed(2)}x '
+      '| watchCooldown=${observationCooldownHours}h '
+      '| confirmWindow=${confirmationWindowHours}h '
       '| cooldown=${cooldownHours}h';
 
   StartupScanPolicy copyWith({
@@ -478,7 +762,29 @@ class StartupScanPolicy {
     double? maxDailyChangePercent,
     double? minQuoteVolume,
     int? minTradeCount,
+    double? minWatchScore,
+    double? minWatchTrendScore,
+    double? minWatchCompressionScore,
+    double? minWatchLiquidityScore,
+    double? minWatchMomentumScore,
+    double? minWatchVolumeRatio,
+    double? minWatchBreakoutDistance,
+    double? maxWatchBreakoutDistance,
+    double? minWatchHourlyBreakoutDistance,
+    double? maxWatchHourlyBreakoutDistance,
+    double? minWatchNearTermPivotDistance,
+    double? maxWatchNearTermPivotDistance,
+    double? minWatchQuoteVolume,
+    int? minWatchTradeCount,
+    double? minMarketTrendBreadthForEntry,
+    double? minMarketMomentumBreadthForEntry,
+    double? minMarketVolumeBreadthForEntry,
+    double? maxRedBreadthForEntry,
+    double? maxDeepRedBreadthForEntry,
     int? maxPushCandidates,
+    int? maxObservationCandidates,
+    int? observationCooldownHours,
+    int? confirmationWindowHours,
     int? cooldownHours,
   }) {
     return StartupScanPolicy(
@@ -510,7 +816,46 @@ class StartupScanPolicy {
           maxDailyChangePercent ?? this.maxDailyChangePercent,
       minQuoteVolume: minQuoteVolume ?? this.minQuoteVolume,
       minTradeCount: minTradeCount ?? this.minTradeCount,
+      minWatchScore: minWatchScore ?? this.minWatchScore,
+      minWatchTrendScore: minWatchTrendScore ?? this.minWatchTrendScore,
+      minWatchCompressionScore:
+          minWatchCompressionScore ?? this.minWatchCompressionScore,
+      minWatchLiquidityScore:
+          minWatchLiquidityScore ?? this.minWatchLiquidityScore,
+      minWatchMomentumScore:
+          minWatchMomentumScore ?? this.minWatchMomentumScore,
+      minWatchVolumeRatio: minWatchVolumeRatio ?? this.minWatchVolumeRatio,
+      minWatchBreakoutDistance:
+          minWatchBreakoutDistance ?? this.minWatchBreakoutDistance,
+      maxWatchBreakoutDistance:
+          maxWatchBreakoutDistance ?? this.maxWatchBreakoutDistance,
+      minWatchHourlyBreakoutDistance:
+          minWatchHourlyBreakoutDistance ?? this.minWatchHourlyBreakoutDistance,
+      maxWatchHourlyBreakoutDistance:
+          maxWatchHourlyBreakoutDistance ?? this.maxWatchHourlyBreakoutDistance,
+      minWatchNearTermPivotDistance:
+          minWatchNearTermPivotDistance ?? this.minWatchNearTermPivotDistance,
+      maxWatchNearTermPivotDistance:
+          maxWatchNearTermPivotDistance ?? this.maxWatchNearTermPivotDistance,
+      minWatchQuoteVolume: minWatchQuoteVolume ?? this.minWatchQuoteVolume,
+      minWatchTradeCount: minWatchTradeCount ?? this.minWatchTradeCount,
+      minMarketTrendBreadthForEntry:
+          minMarketTrendBreadthForEntry ?? this.minMarketTrendBreadthForEntry,
+      minMarketMomentumBreadthForEntry: minMarketMomentumBreadthForEntry ??
+          this.minMarketMomentumBreadthForEntry,
+      minMarketVolumeBreadthForEntry:
+          minMarketVolumeBreadthForEntry ?? this.minMarketVolumeBreadthForEntry,
+      maxRedBreadthForEntry:
+          maxRedBreadthForEntry ?? this.maxRedBreadthForEntry,
+      maxDeepRedBreadthForEntry:
+          maxDeepRedBreadthForEntry ?? this.maxDeepRedBreadthForEntry,
       maxPushCandidates: maxPushCandidates ?? this.maxPushCandidates,
+      maxObservationCandidates:
+          maxObservationCandidates ?? this.maxObservationCandidates,
+      observationCooldownHours:
+          observationCooldownHours ?? this.observationCooldownHours,
+      confirmationWindowHours:
+          confirmationWindowHours ?? this.confirmationWindowHours,
       cooldownHours: cooldownHours ?? this.cooldownHours,
     );
   }
@@ -536,9 +881,203 @@ class StartupScanPolicy {
         'maxDailyChangePercent': maxDailyChangePercent,
         'minQuoteVolume': minQuoteVolume,
         'minTradeCount': minTradeCount,
+        'minWatchScore': minWatchScore,
+        'minWatchTrendScore': minWatchTrendScore,
+        'minWatchCompressionScore': minWatchCompressionScore,
+        'minWatchLiquidityScore': minWatchLiquidityScore,
+        'minWatchMomentumScore': minWatchMomentumScore,
+        'minWatchVolumeRatio': minWatchVolumeRatio,
+        'minWatchBreakoutDistance': minWatchBreakoutDistance,
+        'maxWatchBreakoutDistance': maxWatchBreakoutDistance,
+        'minWatchHourlyBreakoutDistance': minWatchHourlyBreakoutDistance,
+        'maxWatchHourlyBreakoutDistance': maxWatchHourlyBreakoutDistance,
+        'minWatchNearTermPivotDistance': minWatchNearTermPivotDistance,
+        'maxWatchNearTermPivotDistance': maxWatchNearTermPivotDistance,
+        'minWatchQuoteVolume': minWatchQuoteVolume,
+        'minWatchTradeCount': minWatchTradeCount,
+        'minMarketTrendBreadthForEntry': minMarketTrendBreadthForEntry,
+        'minMarketMomentumBreadthForEntry': minMarketMomentumBreadthForEntry,
+        'minMarketVolumeBreadthForEntry': minMarketVolumeBreadthForEntry,
+        'maxRedBreadthForEntry': maxRedBreadthForEntry,
+        'maxDeepRedBreadthForEntry': maxDeepRedBreadthForEntry,
         'maxPushCandidates': maxPushCandidates,
+        'maxObservationCandidates': maxObservationCandidates,
+        'observationCooldownHours': observationCooldownHours,
+        'confirmationWindowHours': confirmationWindowHours,
         'cooldownHours': cooldownHours,
         'summary': summary,
+      };
+
+  factory StartupScanPolicy.fromJson(Map<String, dynamic> json) {
+    return StartupScanPolicy(
+      label: json['label'] as String? ?? defaultPolicy.label,
+      minScore:
+          (json['minScore'] as num?)?.toDouble() ?? defaultPolicy.minScore,
+      minTrendScore: (json['minTrendScore'] as num?)?.toDouble() ??
+          defaultPolicy.minTrendScore,
+      minCompressionScore: (json['minCompressionScore'] as num?)?.toDouble() ??
+          defaultPolicy.minCompressionScore,
+      minLiquidityScore: (json['minLiquidityScore'] as num?)?.toDouble() ??
+          defaultPolicy.minLiquidityScore,
+      minMomentumScore: (json['minMomentumScore'] as num?)?.toDouble() ??
+          defaultPolicy.minMomentumScore,
+      minMarketTrendBreadth:
+          (json['minMarketTrendBreadth'] as num?)?.toDouble() ??
+              defaultPolicy.minMarketTrendBreadth,
+      minMarketMomentumBreadth:
+          (json['minMarketMomentumBreadth'] as num?)?.toDouble() ??
+              defaultPolicy.minMarketMomentumBreadth,
+      minVolumeRatio: (json['minVolumeRatio'] as num?)?.toDouble() ??
+          defaultPolicy.minVolumeRatio,
+      minDailyChangePercent:
+          (json['minDailyChangePercent'] as num?)?.toDouble() ??
+              defaultPolicy.minDailyChangePercent,
+      minBreakoutDistance: (json['minBreakoutDistance'] as num?)?.toDouble() ??
+          defaultPolicy.minBreakoutDistance,
+      maxBreakoutDistance: (json['maxBreakoutDistance'] as num?)?.toDouble() ??
+          defaultPolicy.maxBreakoutDistance,
+      minHourlyBreakoutDistance:
+          (json['minHourlyBreakoutDistance'] as num?)?.toDouble() ??
+              defaultPolicy.minHourlyBreakoutDistance,
+      maxHourlyBreakoutDistance:
+          (json['maxHourlyBreakoutDistance'] as num?)?.toDouble() ??
+              defaultPolicy.maxHourlyBreakoutDistance,
+      minNearTermPivotDistance:
+          (json['minNearTermPivotDistance'] as num?)?.toDouble() ??
+              defaultPolicy.minNearTermPivotDistance,
+      maxNearTermPivotDistance:
+          (json['maxNearTermPivotDistance'] as num?)?.toDouble() ??
+              defaultPolicy.maxNearTermPivotDistance,
+      maxThirtyDayMomentum:
+          (json['maxThirtyDayMomentum'] as num?)?.toDouble() ??
+              defaultPolicy.maxThirtyDayMomentum,
+      maxDailyChangePercent:
+          (json['maxDailyChangePercent'] as num?)?.toDouble() ??
+              defaultPolicy.maxDailyChangePercent,
+      minQuoteVolume: (json['minQuoteVolume'] as num?)?.toDouble() ??
+          defaultPolicy.minQuoteVolume,
+      minTradeCount: (json['minTradeCount'] as num?)?.toInt() ??
+          defaultPolicy.minTradeCount,
+      minWatchScore: (json['minWatchScore'] as num?)?.toDouble() ??
+          defaultPolicy.minWatchScore,
+      minWatchTrendScore: (json['minWatchTrendScore'] as num?)?.toDouble() ??
+          defaultPolicy.minWatchTrendScore,
+      minWatchCompressionScore:
+          (json['minWatchCompressionScore'] as num?)?.toDouble() ??
+              defaultPolicy.minWatchCompressionScore,
+      minWatchLiquidityScore:
+          (json['minWatchLiquidityScore'] as num?)?.toDouble() ??
+              defaultPolicy.minWatchLiquidityScore,
+      minWatchMomentumScore:
+          (json['minWatchMomentumScore'] as num?)?.toDouble() ??
+              defaultPolicy.minWatchMomentumScore,
+      minWatchVolumeRatio: (json['minWatchVolumeRatio'] as num?)?.toDouble() ??
+          defaultPolicy.minWatchVolumeRatio,
+      minWatchBreakoutDistance:
+          (json['minWatchBreakoutDistance'] as num?)?.toDouble() ??
+              defaultPolicy.minWatchBreakoutDistance,
+      maxWatchBreakoutDistance:
+          (json['maxWatchBreakoutDistance'] as num?)?.toDouble() ??
+              defaultPolicy.maxWatchBreakoutDistance,
+      minWatchHourlyBreakoutDistance:
+          (json['minWatchHourlyBreakoutDistance'] as num?)?.toDouble() ??
+              defaultPolicy.minWatchHourlyBreakoutDistance,
+      maxWatchHourlyBreakoutDistance:
+          (json['maxWatchHourlyBreakoutDistance'] as num?)?.toDouble() ??
+              defaultPolicy.maxWatchHourlyBreakoutDistance,
+      minWatchNearTermPivotDistance:
+          (json['minWatchNearTermPivotDistance'] as num?)?.toDouble() ??
+              defaultPolicy.minWatchNearTermPivotDistance,
+      maxWatchNearTermPivotDistance:
+          (json['maxWatchNearTermPivotDistance'] as num?)?.toDouble() ??
+              defaultPolicy.maxWatchNearTermPivotDistance,
+      minWatchQuoteVolume: (json['minWatchQuoteVolume'] as num?)?.toDouble() ??
+          defaultPolicy.minWatchQuoteVolume,
+      minWatchTradeCount: (json['minWatchTradeCount'] as num?)?.toInt() ??
+          defaultPolicy.minWatchTradeCount,
+      minMarketTrendBreadthForEntry:
+          (json['minMarketTrendBreadthForEntry'] as num?)?.toDouble() ??
+              defaultPolicy.minMarketTrendBreadthForEntry,
+      minMarketMomentumBreadthForEntry:
+          (json['minMarketMomentumBreadthForEntry'] as num?)?.toDouble() ??
+              defaultPolicy.minMarketMomentumBreadthForEntry,
+      minMarketVolumeBreadthForEntry:
+          (json['minMarketVolumeBreadthForEntry'] as num?)?.toDouble() ??
+              defaultPolicy.minMarketVolumeBreadthForEntry,
+      maxRedBreadthForEntry:
+          (json['maxRedBreadthForEntry'] as num?)?.toDouble() ??
+              defaultPolicy.maxRedBreadthForEntry,
+      maxDeepRedBreadthForEntry:
+          (json['maxDeepRedBreadthForEntry'] as num?)?.toDouble() ??
+              defaultPolicy.maxDeepRedBreadthForEntry,
+      maxPushCandidates: (json['maxPushCandidates'] as num?)?.toInt() ??
+          defaultPolicy.maxPushCandidates,
+      maxObservationCandidates:
+          (json['maxObservationCandidates'] as num?)?.toInt() ??
+              defaultPolicy.maxObservationCandidates,
+      observationCooldownHours:
+          (json['observationCooldownHours'] as num?)?.toInt() ??
+              defaultPolicy.observationCooldownHours,
+      confirmationWindowHours:
+          (json['confirmationWindowHours'] as num?)?.toInt() ??
+              defaultPolicy.confirmationWindowHours,
+      cooldownHours: (json['cooldownHours'] as num?)?.toInt() ??
+          defaultPolicy.cooldownHours,
+    );
+  }
+}
+
+class StartupMarketRegime {
+  final bool allowEntries;
+  final String status;
+  final String reason;
+  final double marketTrendBreadth;
+  final double marketMomentumBreadth;
+  final double marketVolumeBreadth;
+  final double redBreadth;
+  final double deepRedBreadth;
+  final String benchmarkStatus;
+  final double benchmarkScore;
+  final String benchmarkReason;
+  final double btcDailyTrend;
+  final double btcHourlyTrend;
+  final double ethDailyTrend;
+  final double ethHourlyTrend;
+
+  const StartupMarketRegime({
+    required this.allowEntries,
+    required this.status,
+    required this.reason,
+    required this.marketTrendBreadth,
+    required this.marketMomentumBreadth,
+    required this.marketVolumeBreadth,
+    required this.redBreadth,
+    required this.deepRedBreadth,
+    this.benchmarkStatus = 'unavailable',
+    this.benchmarkScore = 0,
+    this.benchmarkReason = '',
+    this.btcDailyTrend = 0,
+    this.btcHourlyTrend = 0,
+    this.ethDailyTrend = 0,
+    this.ethHourlyTrend = 0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'allowEntries': allowEntries,
+        'status': status,
+        'reason': reason,
+        'marketTrendBreadth': marketTrendBreadth,
+        'marketMomentumBreadth': marketMomentumBreadth,
+        'marketVolumeBreadth': marketVolumeBreadth,
+        'redBreadth': redBreadth,
+        'deepRedBreadth': deepRedBreadth,
+        'benchmarkStatus': benchmarkStatus,
+        'benchmarkScore': benchmarkScore,
+        'benchmarkReason': benchmarkReason,
+        'btcDailyTrend': btcDailyTrend,
+        'btcHourlyTrend': btcHourlyTrend,
+        'ethDailyTrend': ethDailyTrend,
+        'ethHourlyTrend': ethHourlyTrend,
       };
 }
 
@@ -546,6 +1085,8 @@ class StartupScanCandidate {
   final String symbol;
   final double currentPrice;
   final double score;
+  final double setupScore;
+  final double confirmationScore;
   final double trendScore;
   final double compressionScore;
   final double momentumScore;
@@ -559,12 +1100,17 @@ class StartupScanCandidate {
   final double sevenDayMomentum;
   final double thirtyDayMomentum;
   final String reason;
+  final String signalStage;
+  final bool shouldWatch;
+  final bool blockedByMarket;
   final bool shouldNotify;
 
   const StartupScanCandidate({
     required this.symbol,
     required this.currentPrice,
     required this.score,
+    required this.setupScore,
+    required this.confirmationScore,
     required this.trendScore,
     required this.compressionScore,
     required this.momentumScore,
@@ -578,6 +1124,9 @@ class StartupScanCandidate {
     required this.sevenDayMomentum,
     required this.thirtyDayMomentum,
     required this.reason,
+    required this.signalStage,
+    required this.shouldWatch,
+    required this.blockedByMarket,
     required this.shouldNotify,
   });
 
@@ -585,6 +1134,8 @@ class StartupScanCandidate {
         'symbol': symbol,
         'currentPrice': currentPrice,
         'score': score,
+        'setupScore': setupScore,
+        'confirmationScore': confirmationScore,
         'trendScore': trendScore,
         'compressionScore': compressionScore,
         'momentumScore': momentumScore,
@@ -598,6 +1149,9 @@ class StartupScanCandidate {
         'sevenDayMomentum': sevenDayMomentum,
         'thirtyDayMomentum': thirtyDayMomentum,
         'reason': reason,
+        'signalStage': signalStage,
+        'shouldWatch': shouldWatch,
+        'blockedByMarket': blockedByMarket,
         'shouldNotify': shouldNotify,
       };
 }
@@ -607,6 +1161,7 @@ class StartupScanReport {
   final int universeSize;
   final int analyzedSymbols;
   final String strategyLabel;
+  final StartupMarketRegime marketRegime;
   final List<StartupScanCandidate> candidates;
   final String notes;
 
@@ -615,6 +1170,7 @@ class StartupScanReport {
     required this.universeSize,
     required this.analyzedSymbols,
     required this.strategyLabel,
+    required this.marketRegime,
     required this.candidates,
     required this.notes,
   });
@@ -622,11 +1178,19 @@ class StartupScanReport {
   List<StartupScanCandidate> get actionableCandidates =>
       candidates.where((item) => item.shouldNotify).toList();
 
+  List<StartupScanCandidate> get observationCandidates =>
+      candidates.where((item) => item.signalStage == 'watch').toList();
+
+  List<StartupScanCandidate> get blockedCandidates => candidates
+      .where((item) => item.signalStage == 'blocked_by_market')
+      .toList();
+
   Map<String, dynamic> toJson() => {
         'generatedAt': generatedAt.toIso8601String(),
         'universeSize': universeSize,
         'analyzedSymbols': analyzedSymbols,
         'strategyLabel': strategyLabel,
+        'marketRegime': marketRegime.toJson(),
         'notes': notes,
         'candidates': candidates.map((item) => item.toJson()).toList(),
       };
@@ -664,4 +1228,50 @@ class _RawStartupProfile {
     required this.dailyRange7,
     required this.volumeRatio,
   });
+}
+
+class _BenchmarkSnapshot {
+  final String symbol;
+  final double score;
+  final double dailyTrend;
+  final double hourlyTrend;
+
+  const _BenchmarkSnapshot({
+    required this.symbol,
+    required this.score,
+    required this.dailyTrend,
+    required this.hourlyTrend,
+  });
+}
+
+class _BenchmarkContext {
+  final bool available;
+  final double score;
+  final String status;
+  final String reason;
+  final double btcDailyTrend;
+  final double btcHourlyTrend;
+  final double ethDailyTrend;
+  final double ethHourlyTrend;
+
+  const _BenchmarkContext({
+    required this.available,
+    required this.score,
+    required this.status,
+    required this.reason,
+    required this.btcDailyTrend,
+    required this.btcHourlyTrend,
+    required this.ethDailyTrend,
+    required this.ethHourlyTrend,
+  });
+
+  const _BenchmarkContext.unavailable()
+      : available = false,
+        score = 0,
+        status = 'unavailable',
+        reason = 'BTC/ETH 基准数据不足，暂时仅按全市场广度过滤。',
+        btcDailyTrend = 0,
+        btcHourlyTrend = 0,
+        ethDailyTrend = 0,
+        ethHourlyTrend = 0;
 }

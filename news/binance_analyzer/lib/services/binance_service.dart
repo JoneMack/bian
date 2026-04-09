@@ -5,6 +5,8 @@ import 'package:http/http.dart' as http;
 import '../models/coin_data.dart';
 
 class BinanceService {
+  static const int maxKlineRequestLimit = 1000;
+
   // ── 多节点轮询 ──────────────────────────────────────────
   // data-api.binance.vision = 官方公开行情节点（无需 API Key，对国内更友好）
   static const List<String> _hosts = [
@@ -291,12 +293,19 @@ class BinanceService {
     }
 
     final bars = await _withHostFallback<List<Kline>>(
-      (host) => _fetchKlinesOnHost(
-        host,
-        symbol,
-        interval: interval,
-        limit: limit,
-      ),
+      (host) => limit <= maxKlineRequestLimit
+          ? _fetchKlinesOnHost(
+              host,
+              symbol,
+              interval: interval,
+              limit: limit,
+            )
+          : _fetchExtendedKlinesOnHost(
+              host,
+              symbol,
+              interval: interval,
+              limit: limit,
+            ),
       debugLabel: 'klines($symbol/$interval)',
     );
 
@@ -353,12 +362,19 @@ class BinanceService {
     String symbol, {
     required String interval,
     required int limit,
+    int? endTime,
   }) async {
-    final uri = Uri.parse('$host/api/v3/klines').replace(queryParameters: {
+    final queryParameters = <String, String>{
       'symbol': symbol,
       'interval': interval,
       'limit': limit.toString(),
-    });
+    };
+    if (endTime != null && endTime > 0) {
+      queryParameters['endTime'] = '$endTime';
+    }
+
+    final uri = Uri.parse('$host/api/v3/klines')
+        .replace(queryParameters: queryParameters);
 
     final resp = await http.get(uri).timeout(const Duration(seconds: 12));
     if (resp.statusCode != 200) return null;
@@ -378,6 +394,57 @@ class BinanceService {
         tradeCount: row[8] as int? ?? 0,
       );
     }).toList();
+  }
+
+  Future<List<Kline>?> _fetchExtendedKlinesOnHost(
+    String host,
+    String symbol, {
+    required String interval,
+    required int limit,
+  }) async {
+    final all = <Kline>[];
+    int? endTime;
+
+    while (all.length < limit) {
+      final remaining = limit - all.length;
+      final batchSize = min(maxKlineRequestLimit, remaining);
+      final batch = await _fetchKlinesOnHost(
+        host,
+        symbol,
+        interval: interval,
+        limit: batchSize,
+        endTime: endTime,
+      );
+      if (batch == null || batch.isEmpty) {
+        break;
+      }
+
+      all.insertAll(0, batch);
+
+      if (batch.length < batchSize) {
+        break;
+      }
+
+      final earliestOpenTime = batch.first.openTime;
+      if (earliestOpenTime <= 0) {
+        break;
+      }
+      endTime = earliestOpenTime - 1;
+    }
+
+    if (all.isEmpty) return null;
+
+    final deduped = <int, Kline>{};
+    for (final bar in all) {
+      deduped[bar.openTime] = bar;
+    }
+    final ordered = deduped.values.toList()
+      ..sort((a, b) => a.openTime.compareTo(b.openTime));
+
+    if (ordered.length <= limit) {
+      return ordered;
+    }
+    return ordered.sublist(ordered.length - limit);
   }
 
   Future<List<String>?> _fetchTradableUsdtSymbolsOnHost(

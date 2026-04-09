@@ -1,16 +1,24 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:binance_analyzer/services/binance_service.dart';
 import 'package:binance_analyzer/services/startup_strategy_backtest_service.dart';
 
-const int _hourlyBarsFor45Days = 1200;
-const int _dailyBars = 90;
+const int _dailyWarmupBars = 70;
 
 Future<void> main() async {
   final service = BinanceService();
   final optimizer = StartupStrategyBacktestService();
   final symbolLimit = _loadSymbolLimit();
+  final windowDays = optimizer.normalizeWindowDays(
+    StartupStrategyBacktestService.defaultOptimizationWindowDays,
+  );
+  final maxWindowDays = windowDays.reduce(max);
+  final hourlyBars = maxWindowDays * 24 +
+      StartupStrategyBacktestService.replayLookbackHours +
+      24;
+  final dailyBars = maxWindowDays + _dailyWarmupBars;
 
   stdout.writeln('Resolving tradable USDT symbols...');
   final coins = await service.fetchTradableUsdtTickers(limit: symbolLimit);
@@ -22,77 +30,93 @@ Future<void> main() async {
   final dailyHistory = await service.fetchWatchlistKlines(
     symbols: activeSymbols,
     interval: '1d',
-    limit: _dailyBars,
+    limit: dailyBars,
     forceRefresh: true,
     chunkSize: 18,
   );
 
   stdout.writeln(
-    'Fetching hourly history ($_hourlyBarsFor45Days bars)...',
+    'Fetching hourly history ($hourlyBars bars for ${windowDays.join('/')}d windows)...',
   );
   final hourlyHistory = await service.fetchWatchlistKlines(
     symbols: activeSymbols,
     interval: '1h',
-    limit: _hourlyBarsFor45Days,
+    limit: hourlyBars,
     forceRefresh: true,
     chunkSize: 18,
   );
 
-  stdout.writeln('Testing startup strategy rounds...');
+  stdout.writeln(
+      'Testing startup strategy rounds on ${windowDays.join('/')}d...');
   final result = optimizer.optimize(
     dailyHistory: dailyHistory,
     hourlyHistory: hourlyHistory,
+    windowDays: windowDays,
   );
 
   final payload = {
     'generatedAt': DateTime.now().toIso8601String(),
     'symbolLimit': symbolLimit,
+    'windowDays': windowDays,
     'activeSymbols': activeSymbols,
+    'dailyBarsRequested': dailyBars,
+    'hourlyBarsRequested': hourlyBars,
     'dailyHistoryCount': dailyHistory.length,
     'hourlyHistoryCount': hourlyHistory.length,
     'optimization': result.toJson(),
   };
 
   final reportsDir = Directory('build/reports')..createSync(recursive: true);
-  final output =
+  final output = File(
+      '${reportsDir.path}/startup_strategy_optimization_multi_window.json');
+  final legacyAlias =
       File('${reportsDir.path}/startup_strategy_optimization_45d.json');
-  await output.writeAsString(
-    const JsonEncoder.withIndent('  ').convert(payload),
+  final encoded = const JsonEncoder.withIndent('  ').convert(payload);
+  await output.writeAsString(encoded);
+  await legacyAlias.writeAsString(
+    encoded,
   );
 
   stdout.writeln('');
-  stdout.writeln('=== Startup Strategy Optimization 45d ===');
+  stdout.writeln('=== Startup Strategy Optimization Stable ===');
   stdout.writeln(
-    'Rounds tested: ${result.rounds.length} | Symbols: ${activeSymbols.length}',
+    'Windows: ${windowDays.join('/')} 天 | Rounds: ${result.rounds.length} | Symbols: ${activeSymbols.length}',
   );
+  for (final window in result.windows) {
+    stdout.writeln(
+      '${window.days}d best: ${window.bestRound.label} '
+      '| Win ${(window.bestRound.report.winRate * 100).toStringAsFixed(1)}% '
+      '| Avg ${(window.bestRound.report.avgSignalReturn * 100).toStringAsFixed(2)}% '
+      '| Samples ${window.bestRound.report.sampleCount}',
+    );
+  }
   stdout.writeln(
-    'Baseline: ${result.baselineRound.label} '
-    '| WinRate ${(result.baselineRound.report.winRate * 100).toStringAsFixed(1)}% '
-    '| Avg ${(result.baselineRound.report.avgSignalReturn * 100).toStringAsFixed(2)}% '
-    '| Samples ${result.baselineRound.report.sampleCount}',
+    'Stable best: ${result.stableBestRound.label} '
+    '| Stability ${result.stableBestRound.stabilityScore.toStringAsFixed(2)} '
+    '| Gate ${result.stableBestRound.meetsStabilityGate ? 'pass' : 'fallback'}',
   );
-  stdout.writeln(
-    'Best: ${result.bestRound.label} '
-    '| WinRate ${(result.bestRound.report.winRate * 100).toStringAsFixed(1)}% '
-    '| Avg ${(result.bestRound.report.avgSignalReturn * 100).toStringAsFixed(2)}% '
-    '| Samples ${result.bestRound.report.sampleCount}',
-  );
-  stdout.writeln('Best policy: ${result.bestRound.policy.summary}');
+  stdout.writeln('Stable policy: ${result.stableBestRound.policy.summary}');
+  stdout.writeln(result.selectionNote);
   stdout.writeln('');
-  stdout.writeln('Top rounds:');
-  for (final round in result.rounds.take(5)) {
+  stdout.writeln('Top stable rounds:');
+  for (final round in result.stableRounds.take(5)) {
+    final metrics = round.windows
+        .map(
+          (item) =>
+              '${item.days}d ${(item.report.winRate * 100).toStringAsFixed(0)}%/${item.report.sampleCount}',
+        )
+        .join(' | ');
     stdout.writeln(
       '${round.id} ${round.label} '
-      '| score ${round.score.toStringAsFixed(2)} '
-      '| win ${(round.report.winRate * 100).toStringAsFixed(1)}% '
-      '| avg ${(round.report.avgSignalReturn * 100).toStringAsFixed(2)}% '
-      '| samples ${round.report.sampleCount} '
-      '| silent ${(round.report.silentRate * 100).toStringAsFixed(1)}%',
+      '| stability ${round.stabilityScore.toStringAsFixed(2)} '
+      '| gate ${round.meetsStabilityGate ? 'pass' : 'fallback'} '
+      '| $metrics',
     );
   }
 
   stdout.writeln('');
   stdout.writeln('Saved optimization report to ${output.path}');
+  stdout.writeln('Legacy alias updated at ${legacyAlias.path}');
 }
 
 int? _loadSymbolLimit() {

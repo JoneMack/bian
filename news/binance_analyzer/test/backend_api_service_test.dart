@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:binance_analyzer/services/backend_api_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -172,5 +174,57 @@ void main() {
     expect(items.single.source, 'Cointelegraph');
     expect(items.single.tags, ['BTC', 'ETF']);
     expect(items.single.isHot, isTrue);
+  });
+
+  test('submits client signal action to backend', () async {
+    final client = MockClient((request) async {
+      expect(request.method, 'POST');
+      expect(request.url.toString(), 'https://example.com/api/signal-action');
+
+      final payload = jsonDecode(request.body) as Map<String, dynamic>;
+      expect(payload['signalId'], '2026-04-09|buy|FET|可入场');
+      expect(payload['symbol'], 'FET');
+      expect(payload['signalType'], 'buy');
+      expect(payload['actionType'], 'confirm');
+      expect(payload['signalSource'], 'feishu');
+
+      return http.Response(
+        '''
+        {
+          "created": true,
+          "status": "created",
+          "message": "已记录客户端信号动作",
+          "record": {
+            "signalId": "2026-04-09|buy|FET|可入场",
+            "actionType": "confirm"
+          }
+        }
+        ''',
+        201,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final service = BackendApiService(
+      client: client,
+      baseUrlOverride: 'https://example.com/api',
+    );
+
+    final result = await service.submitSignalAction(
+      signalId: '2026-04-09|buy|FET|可入场',
+      symbol: 'fet',
+      signalType: 'buy',
+      signalSource: 'feishu',
+      actionType: 'confirm',
+      price: 1.23,
+      timingLabel: '可入场',
+      timingReason: '突破后回踩稳住',
+      totalScore: 0.88,
+      entryScore: 0.79,
+    );
+
+    expect(result.created, isTrue);
+    expect(result.status, 'created');
+    expect(result.record?['actionType'], 'confirm');
   });
 }

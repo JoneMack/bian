@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/material.dart';
 
 import 'package:binance_analyzer/models/coin_data.dart';
+import 'package:binance_analyzer/models/strategy_snapshot.dart';
 import 'package:binance_analyzer/screens/main_nav_screen.dart';
 import 'package:binance_analyzer/screens/picks_screen.dart';
 import 'package:binance_analyzer/theme/app_theme.dart';
@@ -67,6 +68,36 @@ void main() {
       updatedAt: DateTime(2026, 4, 2, 10, 30),
       loading: false,
       liveConnected: true,
+      entryAlerts: const [
+        EntryAlertSignal(
+          symbol: 'FET',
+          timingLabel: '可入场',
+          timingReason: '突破后回踩稳住',
+          currentPrice: 1.245,
+          dayChangePercent: 6.8,
+          totalScore: 0.81,
+          entryScore: 0.76,
+          volumeRatio: 1.4,
+          breakoutDistance: 0.8,
+          pullbackPercent: 1.1,
+          shouldNotify: true,
+        ),
+      ],
+      exitAlerts: const [
+        EntryAlertSignal(
+          symbol: 'TON',
+          timingLabel: '止盈减仓',
+          timingReason: '短线回撤增大',
+          currentPrice: 5.42,
+          dayChangePercent: -2.1,
+          totalScore: 0.72,
+          entryScore: 0.61,
+          volumeRatio: 0.9,
+          breakoutDistance: -1.3,
+          pullbackPercent: 3.2,
+          shouldNotify: true,
+        ),
+      ],
     );
 
     await tester.pumpWidget(
@@ -75,13 +106,31 @@ void main() {
         home: PicksScreen(
           state: state,
           onRefresh: ({bool silent = false}) async {},
+          onSignalAction: (
+            EntryAlertSignal signal,
+            String signalType,
+            String actionType,
+          ) async {},
+          resolveSignalActionStatus: (
+            EntryAlertSignal signal,
+            String signalType,
+          ) =>
+              null,
+          isSignalActionSubmitting: (
+            EntryAlertSignal signal,
+            String signalType,
+          ) =>
+              false,
         ),
       ),
     );
 
     expect(find.text('今日精选'), findsOneWidget);
     expect(find.text('AI 智能推荐 · 每日3个'), findsOneWidget);
+    expect(find.text('飞书信号待处理'), findsOneWidget);
     expect(find.text('今日推荐买入'), findsOneWidget);
-    expect(find.text('FET'), findsOneWidget);
+    expect(find.text('FET'), findsWidgets);
+    expect(find.text('确定'), findsOneWidget);
+    expect(find.text('取消'), findsOneWidget);
   });
 }

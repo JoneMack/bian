@@ -7,6 +7,31 @@ import '../models/market_snapshot.dart';
 import '../models/news_item.dart';
 import 'binance_service.dart';
 
+class SignalActionSubmissionResult {
+  final bool created;
+  final String status;
+  final String message;
+  final Map<String, dynamic>? record;
+
+  const SignalActionSubmissionResult({
+    required this.created,
+    required this.status,
+    required this.message,
+    this.record,
+  });
+
+  factory SignalActionSubmissionResult.fromJson(Map<String, dynamic> json) {
+    return SignalActionSubmissionResult(
+      created: json['created'] == true,
+      status: json['status']?.toString() ?? 'unknown',
+      message: json['message']?.toString() ?? '',
+      record: json['record'] is Map
+          ? Map<String, dynamic>.from(json['record'] as Map)
+          : null,
+    );
+  }
+}
+
 class BackendApiService {
   static const String _rawBaseUrl =
       String.fromEnvironment('BACKEND_BASE_URL', defaultValue: '');
@@ -118,6 +143,62 @@ class BackendApiService {
         .map((item) => NewsItem.fromJson(item as Map<String, dynamic>))
         .toList();
     return items;
+  }
+
+  Future<SignalActionSubmissionResult> submitSignalAction({
+    required String signalId,
+    required String symbol,
+    required String signalType,
+    required String signalSource,
+    required String actionType,
+    required double price,
+    String timingLabel = '',
+    String timingReason = '',
+    double totalScore = 0,
+    double entryScore = 0,
+    String note = '',
+    String client = 'app',
+  }) async {
+    final resolvedBaseUrl = this.resolvedBaseUrl;
+    if (resolvedBaseUrl == null) {
+      throw StateError('BACKEND_BASE_URL 未配置');
+    }
+
+    final uri = Uri.parse('$resolvedBaseUrl/signal-action');
+    final response = await _client
+        .post(
+          uri,
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+          },
+          body: jsonEncode({
+            'signalId': signalId,
+            'symbol': symbol.trim().toUpperCase(),
+            'signalType': signalType.trim().toLowerCase(),
+            'signalSource': signalSource.trim().toLowerCase(),
+            'actionType': actionType.trim().toLowerCase(),
+            'price': price,
+            'timingLabel': timingLabel,
+            'timingReason': timingReason,
+            'totalScore': totalScore,
+            'entryScore': entryScore,
+            'note': note,
+            'client': client,
+          }),
+        )
+        .timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 200 && response.statusCode != 201) {
+      throw Exception(
+        '后台信号动作记录失败(${response.statusCode})：${response.body}',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception('后台返回的 signal-action 格式无效');
+    }
+    return SignalActionSubmissionResult.fromJson(decoded);
   }
 
   static String? _normalizeBaseUrl(String? value) {

@@ -132,4 +132,18 @@ void main() {
     expect(loaded.single.picks.single.isWin, isTrue);
     expect(loaded.single.picks.single.changePercent, closeTo(8.0, 0.001));
   });
+
+  test('signal action statuses can be saved and restored locally', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = HistoryService();
+    await service.saveSignalActionStatuses({
+      '2026-04-09|buy|FET|可入场': 'confirm',
+      '2026-04-09|sell|LINK|止盈减仓': 'cancel',
+    });
+
+    final statuses = await service.loadSignalActionStatuses();
+    expect(statuses['2026-04-09|buy|FET|可入场'], 'confirm');
+    expect(statuses['2026-04-09|sell|LINK|止盈减仓'], 'cancel');
+  });
 }

@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:binance_analyzer/models/news_item.dart';
 import 'package:binance_analyzer/services/news_service.dart';
 
 void main() {
@@ -60,5 +61,115 @@ void main() {
         'Markets slumped as traders reacted to the SEC action.');
     expect(items.first.tags, containsAll(['Markets', 'SEC', 'MARKETS']));
     expect(items.first.isHot, isTrue);
+  });
+
+  test('extractArticleBody prefers json-ld article body when present', () {
+    const html = '''
+<!doctype html>
+<html>
+  <head>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "NewsArticle",
+        "headline": "Bitcoin ETF inflows spike",
+        "articleBody": "Bitcoin ETF inflows accelerated overnight as institutional desks added exposure. Traders said AI-related tokens also moved higher after the ETF momentum improved overall sentiment across majors."
+      }
+    </script>
+  </head>
+  <body>
+    <article><p>Short intro only.</p></article>
+  </body>
+</html>
+''';
+
+    final body = NewsService.extractArticleBody(
+      html,
+      sourceName: 'Cointelegraph',
+    );
+
+    expect(body, contains('institutional desks added exposure'));
+    expect(body, contains('overall sentiment across majors'));
+    expect(body.length, greaterThan(120));
+  });
+
+  test('extractArticleBody falls back to article paragraphs', () {
+    const html = '''
+<!doctype html>
+<html>
+  <body>
+    <article>
+      <p>Advertisement</p>
+      <p>Bitcoin held above key support while traders monitored ETF flow data and macro headlines for the next directional move.</p>
+      <p>Analysts said the market backdrop improved as large-cap tokens stabilized and volumes rotated back into higher-beta names.</p>
+      <p>Read more: some internal link</p>
+    </article>
+  </body>
+</html>
+''';
+
+    final body = NewsService.extractArticleBody(
+      html,
+      sourceName: 'Decrypt',
+    );
+
+    expect(body, contains('Bitcoin held above key support'));
+    expect(body, contains('higher-beta names'));
+    expect(body, isNot(contains('Advertisement')));
+    expect(body, isNot(contains('Read more')));
+  });
+
+  test('selectActionableSignals marks major listing news as bullish signal',
+      () {
+    final service = NewsService();
+    final items = service.selectActionableSignals([
+      NewsItem(
+        id: '1',
+        title: 'Binance announces FET listing with new trading pairs',
+        body:
+            'Breaking news: Binance listing for Fetch.ai token starts today and traders expect strong spot volume.',
+        translatedTitle: '币安宣布上线 FET 并开放新交易对',
+        translatedBody: '突发消息：币安上线 Fetch.ai，市场预期现货成交量快速放大。',
+        url: 'https://example.com/fet-listing',
+        source: 'Binance',
+        imageUrl: '',
+        publishedAt: DateTime.now().subtract(const Duration(minutes: 40)),
+        tags: const ['FET', 'Binance'],
+        isHot: true,
+      ),
+    ]);
+
+    expect(items, hasLength(1));
+    expect(items.first.actionableSignal, isTrue);
+    expect(items.first.impactDirection, 'bullish');
+    expect(items.first.impactScore, greaterThanOrEqualTo(0.72));
+    expect(items.first.eventSummary, contains('上币'));
+    expect(items.first.relatedSymbols, contains('FET'));
+  });
+
+  test('selectActionableSignals marks exploit news as bearish signal', () {
+    final service = NewsService();
+    final items = service.selectActionableSignals([
+      NewsItem(
+        id: '2',
+        title: 'Major exploit hits Solana protocol as funds are stolen',
+        body:
+            'Breaking: hackers exploited a Solana protocol and over \$30 million was stolen, triggering panic across the ecosystem.',
+        translatedTitle: 'Solana 生态协议遭重大攻击，资金被盗',
+        translatedBody: '突发：黑客利用漏洞攻击 Solana 协议，超 3000 万美元资产被盗，引发市场恐慌。',
+        url: 'https://example.com/sol-hack',
+        source: 'Cointelegraph',
+        imageUrl: '',
+        publishedAt: DateTime.now().subtract(const Duration(minutes: 25)),
+        tags: const ['SOL'],
+        isHot: true,
+      ),
+    ]);
+
+    expect(items, hasLength(1));
+    expect(items.first.actionableSignal, isTrue);
+    expect(items.first.impactDirection, 'bearish');
+    expect(items.first.eventSummary, contains('安全事件'));
+    expect(items.first.relatedSymbols, contains('SOL'));
   });
 }

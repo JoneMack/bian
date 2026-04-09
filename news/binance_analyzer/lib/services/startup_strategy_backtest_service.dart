@@ -7,6 +7,7 @@ import 'startup_scanner_service.dart';
 class StartupStrategyBacktestService {
   static const int replayLookbackHours = 96;
   static const int evaluationHours = 24;
+  static const List<int> defaultOptimizationWindowDays = [45, 90, 180];
 
   final StartupScannerService _scanner;
 
@@ -260,42 +261,114 @@ class StartupStrategyBacktestService {
     required Map<String, List<Kline>> dailyHistory,
     required Map<String, List<Kline>> hourlyHistory,
     List<StartupPolicyRound>? rounds,
+    List<int>? windowDays,
   }) {
     final candidates = rounds ?? buildDefaultPolicyRounds();
-    final results = candidates
-        .map(
-          (round) => StartupPolicyRoundResult(
-            id: round.id,
-            label: round.label,
-            policy: round.policy,
-            report: analyze(
-              dailyHistory: dailyHistory,
-              hourlyHistory: hourlyHistory,
-              policy: round.policy,
-            ),
-          ),
-        )
-        .map((item) => item.copyWith(score: _optimizationScore(item.report)))
-        .toList()
-      ..sort((a, b) {
-        final byScore = b.score.compareTo(a.score);
-        if (byScore != 0) return byScore;
-        final byWin = b.report.winRate.compareTo(a.report.winRate);
-        if (byWin != 0) return byWin;
-        return b.report.sampleCount.compareTo(a.report.sampleCount);
-      });
+    final normalizedWindowDays = normalizeWindowDays(windowDays);
+    final normalizedDaily = {
+      for (final entry in dailyHistory.entries) entry.key: _sorted(entry.value),
+    };
+    final normalizedHourly = {
+      for (final entry in hourlyHistory.entries)
+        entry.key: _sorted(entry.value),
+    };
+    final eligibleSymbols = _resolveEligibleSymbols(
+      dailyHistory: normalizedDaily,
+      hourlyHistory: normalizedHourly,
+    );
 
-    final best = results.first;
-    final baseline = results.firstWhere(
-      (item) => item.id == 'round_01_baseline',
-      orElse: () => best,
+    final primaryWindowDays = normalizedWindowDays.first;
+    final windowResults = <StartupOptimizationWindowResult>[];
+    final roundMetricsById = <String, List<StartupWindowRoundResult>>{};
+
+    for (final round in candidates) {
+      final states = eligibleSymbols.length < 10
+          ? const <_StartupReplayState>[]
+          : _buildReplayStates(
+              dailyHistory: normalizedDaily,
+              hourlyHistory: normalizedHourly,
+              eligibleSymbols: eligibleSymbols,
+              policy: round.policy,
+            );
+      final metrics = normalizedWindowDays
+          .map(
+            (days) => StartupWindowRoundResult(
+              days: days,
+              minimumSamples: _minimumSamplesForWindow(days),
+              report: _evaluate(
+                states,
+                round.policy,
+                windowDays: days,
+                eligibleSymbolsOverride: eligibleSymbols,
+              ),
+            ),
+          )
+          .map((item) => item.copyWith(score: _optimizationScore(item.report)))
+          .toList()
+        ..sort((a, b) => a.days.compareTo(b.days));
+      roundMetricsById[round.id] = metrics;
+    }
+
+    for (final days in normalizedWindowDays) {
+      final results = candidates.map((round) {
+        final metric = roundMetricsById[round.id]!.firstWhere(
+          (item) => item.days == days,
+        );
+        return StartupPolicyRoundResult(
+          id: round.id,
+          label: round.label,
+          policy: round.policy,
+          report: metric.report,
+          score: metric.score,
+        );
+      }).toList();
+      _sortRoundResults(results);
+
+      final best = results.first;
+      final baseline = results.firstWhere(
+        (item) => item.id == 'round_01_baseline',
+        orElse: () => best,
+      );
+      windowResults.add(
+        StartupOptimizationWindowResult(
+          days: days,
+          rounds: results,
+          bestRound: best,
+          baselineRound: baseline,
+        ),
+      );
+    }
+
+    final stabilityRanking = buildStabilityRanking(
+      windows: windowResults,
+      rounds: candidates,
+    );
+    final qualifiedStable = stabilityRanking
+        .where((item) => item.meetsStabilityGate)
+        .toList(growable: false);
+    final stableBestRound = qualifiedStable.isNotEmpty
+        ? qualifiedStable.first
+        : stabilityRanking.first;
+    final primaryWindow = windowResults.firstWhere(
+      (item) => item.days == primaryWindowDays,
+      orElse: () => windowResults.first,
     );
 
     return StartupStrategyOptimizationResult(
       generatedAt: DateTime.now(),
-      rounds: results,
-      bestRound: best,
-      baselineRound: baseline,
+      windowDays: normalizedWindowDays,
+      primaryWindowDays: primaryWindowDays,
+      rounds: primaryWindow.rounds,
+      bestRound: primaryWindow.bestRound,
+      baselineRound: primaryWindow.baselineRound,
+      windows: windowResults,
+      stableRounds: stabilityRanking,
+      stableBestRound: stableBestRound,
+      selectionNote: _buildSelectionNote(
+        windowDays: normalizedWindowDays,
+        stableBestRound: stableBestRound,
+        qualifiedStableCount: qualifiedStable.length,
+      ),
     );
   }
 
@@ -303,6 +376,7 @@ class StartupStrategyBacktestService {
     required Map<String, List<Kline>> dailyHistory,
     required Map<String, List<Kline>> hourlyHistory,
     required StartupScanPolicy policy,
+    int? windowDays,
   }) {
     final normalizedDaily = {
       for (final entry in dailyHistory.entries) entry.key: _sorted(entry.value),
@@ -312,16 +386,10 @@ class StartupStrategyBacktestService {
         entry.key: _sorted(entry.value),
     };
 
-    final eligibleSymbols = normalizedHourly.keys
-        .where(
-          (symbol) =>
-              (normalizedDaily[symbol]?.length ?? 0) >=
-                  StartupScannerService.minimumDailyBars &&
-              (normalizedHourly[symbol]?.length ?? 0) >=
-                  replayLookbackHours + evaluationHours,
-        )
-        .toList()
-      ..sort();
+    final eligibleSymbols = _resolveEligibleSymbols(
+      dailyHistory: normalizedDaily,
+      hourlyHistory: normalizedHourly,
+    );
 
     if (eligibleSymbols.length < 10) {
       return StartupStrategyBacktestReport.empty(
@@ -331,7 +399,93 @@ class StartupStrategyBacktestService {
       );
     }
 
-    final timelineBars = normalizedHourly[eligibleSymbols.first]!;
+    final states = _buildReplayStates(
+      dailyHistory: normalizedDaily,
+      hourlyHistory: normalizedHourly,
+      eligibleSymbols: eligibleSymbols,
+      policy: policy,
+    );
+
+    return _evaluate(
+      states,
+      policy,
+      windowDays: windowDays,
+      eligibleSymbolsOverride: eligibleSymbols,
+    );
+  }
+
+  List<int> normalizeWindowDays(List<int>? windowDays) {
+    final raw = windowDays == null || windowDays.isEmpty
+        ? defaultOptimizationWindowDays
+        : windowDays;
+    final normalized = raw.where((item) => item > 0).toSet().toList()..sort();
+    return normalized.isEmpty ? [...defaultOptimizationWindowDays] : normalized;
+  }
+
+  List<StartupStablePolicyRoundResult> buildStabilityRanking({
+    required List<StartupOptimizationWindowResult> windows,
+    required Iterable<StartupPolicyRound> rounds,
+  }) {
+    final roundCatalog = {for (final round in rounds) round.id: round};
+    final ranking = roundCatalog.values.map((round) {
+      final metrics = windows.map((window) {
+        final current = window.rounds.firstWhere((item) => item.id == round.id);
+        return StartupWindowRoundResult(
+          days: window.days,
+          minimumSamples: _minimumSamplesForWindow(window.days),
+          report: current.report,
+          score: current.score,
+        );
+      }).toList()
+        ..sort((a, b) => a.days.compareTo(b.days));
+
+      return StartupStablePolicyRoundResult(
+        id: round.id,
+        label: round.label,
+        policy: round.policy,
+        windows: metrics,
+        stabilityScore: _stableCompositeScore(metrics),
+        meetsStabilityGate: _meetsStabilityGate(metrics),
+      );
+    }).toList();
+
+    ranking.sort((a, b) {
+      if (a.meetsStabilityGate != b.meetsStabilityGate) {
+        return a.meetsStabilityGate ? -1 : 1;
+      }
+      final byScore = b.stabilityScore.compareTo(a.stabilityScore);
+      if (byScore != 0) return byScore;
+      final byPositive = b.positiveWindowCount.compareTo(a.positiveWindowCount);
+      if (byPositive != 0) return byPositive;
+      return b.totalSamples.compareTo(a.totalSamples);
+    });
+    return ranking;
+  }
+
+  List<String> _resolveEligibleSymbols({
+    required Map<String, List<Kline>> dailyHistory,
+    required Map<String, List<Kline>> hourlyHistory,
+  }) {
+    return hourlyHistory.keys
+        .where(
+          (symbol) =>
+              (dailyHistory[symbol]?.length ?? 0) >=
+                  StartupScannerService.minimumDailyBars &&
+              (hourlyHistory[symbol]?.length ?? 0) >=
+                  replayLookbackHours + evaluationHours,
+        )
+        .toList()
+      ..sort();
+  }
+
+  List<_StartupReplayState> _buildReplayStates({
+    required Map<String, List<Kline>> dailyHistory,
+    required Map<String, List<Kline>> hourlyHistory,
+    required List<String> eligibleSymbols,
+    required StartupScanPolicy policy,
+  }) {
+    if (eligibleSymbols.isEmpty) return const [];
+    final timelineBars = hourlyHistory[eligibleSymbols.first]!;
     final states = <_StartupReplayState>[];
     for (var index = replayLookbackHours - 1;
         index + evaluationHours < timelineBars.length;
@@ -339,16 +493,15 @@ class StartupStrategyBacktestService {
       final state = _buildReplayState(
         replayIndex: index,
         symbols: eligibleSymbols,
-        dailyHistory: normalizedDaily,
-        hourlyHistory: normalizedHourly,
+        dailyHistory: dailyHistory,
+        hourlyHistory: hourlyHistory,
         policy: policy,
       );
       if (state != null) {
         states.add(state);
       }
     }
-
-    return _evaluate(states, policy);
+    return states;
   }
 
   _StartupReplayState? _buildReplayState({
@@ -427,13 +580,16 @@ class StartupStrategyBacktestService {
 
   StartupStrategyBacktestReport _evaluate(
     List<_StartupReplayState> states,
-    StartupScanPolicy policy,
-  ) {
-    if (states.isEmpty) {
+    StartupScanPolicy policy, {
+    int? windowDays,
+    List<String>? eligibleSymbolsOverride,
+  }) {
+    final windowedStates = _selectWindowStates(states, windowDays: windowDays);
+    if (windowedStates.isEmpty) {
       return StartupStrategyBacktestReport.empty(
         generatedAt: DateTime.now(),
         policy: policy,
-        eligibleSymbols: const [],
+        eligibleSymbols: eligibleSymbolsOverride ?? const [],
       );
     }
 
@@ -445,7 +601,7 @@ class StartupStrategyBacktestService {
     final lastTriggeredAtBySymbol = <String, DateTime>{};
     final bySymbol = <String, _MutableSignalBucket>{};
 
-    for (final state in states) {
+    for (final state in windowedStates) {
       var triggeredThisHour = 0;
 
       for (final candidate in state.actionableCandidates) {
@@ -505,8 +661,9 @@ class StartupStrategyBacktestService {
     return StartupStrategyBacktestReport(
       generatedAt: DateTime.now(),
       policy: policy,
-      eligibleSymbols: states.first.nextCloseReturns.keys.toList()..sort(),
-      simulatedHours: states.length,
+      eligibleSymbols: eligibleSymbolsOverride ??
+          (windowedStates.first.nextCloseReturns.keys.toList()..sort()),
+      simulatedHours: windowedStates.length,
       sampleCount: samples,
       wins: wins,
       silentHours: silentHours,
@@ -536,6 +693,138 @@ class StartupStrategyBacktestService {
         sampleComponent -
         silencePenalty -
         lowSamplePenalty;
+  }
+
+  List<_StartupReplayState> _selectWindowStates(
+    List<_StartupReplayState> states, {
+    int? windowDays,
+  }) {
+    if (states.isEmpty || windowDays == null || windowDays <= 0) {
+      return states;
+    }
+    final endAt = states.last.at;
+    final startAt = endAt.subtract(Duration(days: windowDays));
+    return states.where((state) => !state.at.isBefore(startAt)).toList();
+  }
+
+  void _sortRoundResults(List<StartupPolicyRoundResult> results) {
+    results.sort((a, b) {
+      final byScore = b.score.compareTo(a.score);
+      if (byScore != 0) return byScore;
+      final byWin = b.report.winRate.compareTo(a.report.winRate);
+      if (byWin != 0) return byWin;
+      return b.report.sampleCount.compareTo(a.report.sampleCount);
+    });
+  }
+
+  int _minimumSamplesForWindow(int days) {
+    if (days >= 180) return 16;
+    if (days >= 90) return 10;
+    return 6;
+  }
+
+  double _stableCompositeScore(List<StartupWindowRoundResult> windows) {
+    if (windows.isEmpty) return double.negativeInfinity;
+    final sorted = [...windows]..sort((a, b) => a.days.compareTo(b.days));
+    final weights = _windowWeights(sorted.map((item) => item.days).toList());
+    var weightedScore = 0.0;
+    var samplePenalty = 0.0;
+    var sampleBonus = 0.0;
+    var negativeWindowPenalty = 0.0;
+    final winRates = <double>[];
+    final returns = <double>[];
+
+    for (final item in sorted) {
+      final weight = weights[item.days] ?? (1 / sorted.length);
+      weightedScore += item.score * weight;
+      samplePenalty +=
+          max(0, item.minimumSamples - item.report.sampleCount) * 3.2;
+      sampleBonus +=
+          min(1.0, item.report.sampleCount / max(1, item.minimumSamples)) *
+              6 *
+              weight;
+      winRates.add(item.report.winRate);
+      returns.add(item.report.avgSignalReturn);
+      if (item.report.avgSignalReturn <= 0 || item.report.winRate < 0.5) {
+        negativeWindowPenalty += 9.0;
+      }
+    }
+
+    final recent = sorted.first;
+    final consistencyPenalty =
+        _spread(winRates) * 18 + (_spread(returns) * 100 * 1.8);
+    final recentPenalty = recent.report.avgSignalReturn <= 0
+        ? 14.0
+        : recent.report.winRate < 0.5
+            ? 9.0
+            : 0.0;
+    final allPositiveBonus = sorted.every(
+      (item) => item.report.avgSignalReturn > 0 && item.report.winRate >= 0.5,
+    )
+        ? 10.0
+        : 0.0;
+
+    return weightedScore +
+        sampleBonus +
+        allPositiveBonus -
+        samplePenalty -
+        negativeWindowPenalty -
+        consistencyPenalty -
+        recentPenalty;
+  }
+
+  bool _meetsStabilityGate(List<StartupWindowRoundResult> windows) {
+    if (windows.isEmpty) return false;
+    final sorted = [...windows]..sort((a, b) => a.days.compareTo(b.days));
+    final recent = sorted.first;
+    final long = sorted.last;
+
+    final samplesMet =
+        sorted.every((item) => item.report.sampleCount >= item.minimumSamples);
+    final positiveReturns =
+        sorted.every((item) => item.report.avgSignalReturn > 0);
+    final longEnough = long.report.winRate >= 0.55;
+    final recentNotBroken =
+        recent.report.winRate >= 0.45 && recent.report.avgSignalReturn > -0.003;
+
+    return samplesMet && positiveReturns && longEnough && recentNotBroken;
+  }
+
+  Map<int, double> _windowWeights(List<int> days) {
+    final sorted = [...days]..sort();
+    final known = <int, double>{45: 0.2, 90: 0.3, 180: 0.5};
+    final custom = <int, double>{};
+    var total = 0.0;
+    for (final day in sorted) {
+      final weight = known[day] ?? day.toDouble();
+      custom[day] = weight;
+      total += weight;
+    }
+    if (total <= 0) {
+      return {for (final day in sorted) day: 1 / max(1, sorted.length)};
+    }
+    return {
+      for (final entry in custom.entries) entry.key: entry.value / total,
+    };
+  }
+
+  double _spread(List<double> values) {
+    if (values.length <= 1) return 0.0;
+    final maxValue = values.reduce(max);
+    final minValue = values.reduce(min);
+    return maxValue - minValue;
+  }
+
+  String _buildSelectionNote({
+    required List<int> windowDays,
+    required StartupStablePolicyRoundResult stableBestRound,
+    required int qualifiedStableCount,
+  }) {
+    final windowLabel = windowDays.join('/');
+    if (qualifiedStableCount > 0) {
+      return '已按 $windowLabel 天同时满足样本门槛、长窗口胜率和正收益要求筛选最稳策略，共 $qualifiedStableCount 组达标。';
+    }
+    return '当前没有策略同时满足 $windowLabel 天稳定门槛，已退回综合稳定分最高的 ${stableBestRound.label}，建议继续累积样本后再定型。';
   }
 
   List<Kline> _sorted(List<Kline> bars) {
@@ -634,24 +923,137 @@ class StartupPolicyRoundResult {
       };
 }
 
-class StartupStrategyOptimizationResult {
-  final DateTime generatedAt;
+class StartupWindowRoundResult {
+  final int days;
+  final int minimumSamples;
+  final StartupStrategyBacktestReport report;
+  final double score;
+
+  const StartupWindowRoundResult({
+    required this.days,
+    required this.minimumSamples,
+    required this.report,
+    this.score = 0.0,
+  });
+
+  bool get meetsMinimumSamples => report.sampleCount >= minimumSamples;
+
+  StartupWindowRoundResult copyWith({
+    double? score,
+  }) {
+    return StartupWindowRoundResult(
+      days: days,
+      minimumSamples: minimumSamples,
+      report: report,
+      score: score ?? this.score,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'days': days,
+        'minimumSamples': minimumSamples,
+        'meetsMinimumSamples': meetsMinimumSamples,
+        'score': score,
+        'report': report.toJson(),
+      };
+}
+
+class StartupOptimizationWindowResult {
+  final int days;
   final List<StartupPolicyRoundResult> rounds;
   final StartupPolicyRoundResult baselineRound;
   final StartupPolicyRoundResult bestRound;
 
-  const StartupStrategyOptimizationResult({
-    required this.generatedAt,
+  const StartupOptimizationWindowResult({
+    required this.days,
     required this.rounds,
     required this.baselineRound,
     required this.bestRound,
   });
 
   Map<String, dynamic> toJson() => {
-        'generatedAt': generatedAt.toIso8601String(),
+        'days': days,
         'testedRounds': rounds.length,
         'baselineRound': baselineRound.toJson(),
         'bestRound': bestRound.toJson(),
+        'rounds': rounds.map((item) => item.toJson()).toList(),
+      };
+}
+
+class StartupStablePolicyRoundResult {
+  final String id;
+  final String label;
+  final StartupScanPolicy policy;
+  final List<StartupWindowRoundResult> windows;
+  final double stabilityScore;
+  final bool meetsStabilityGate;
+
+  const StartupStablePolicyRoundResult({
+    required this.id,
+    required this.label,
+    required this.policy,
+    required this.windows,
+    required this.stabilityScore,
+    required this.meetsStabilityGate,
+  });
+
+  int get totalSamples =>
+      windows.fold<int>(0, (sum, item) => sum + item.report.sampleCount);
+
+  int get positiveWindowCount => windows
+      .where(
+        (item) => item.report.avgSignalReturn > 0 && item.report.winRate >= 0.5,
+      )
+      .length;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'label': label,
+        'stabilityScore': stabilityScore,
+        'meetsStabilityGate': meetsStabilityGate,
+        'totalSamples': totalSamples,
+        'positiveWindowCount': positiveWindowCount,
+        'policy': policy.toJson(),
+        'windows': windows.map((item) => item.toJson()).toList(),
+      };
+}
+
+class StartupStrategyOptimizationResult {
+  final DateTime generatedAt;
+  final List<int> windowDays;
+  final int primaryWindowDays;
+  final List<StartupPolicyRoundResult> rounds;
+  final StartupPolicyRoundResult baselineRound;
+  final StartupPolicyRoundResult bestRound;
+  final List<StartupOptimizationWindowResult> windows;
+  final List<StartupStablePolicyRoundResult> stableRounds;
+  final StartupStablePolicyRoundResult stableBestRound;
+  final String selectionNote;
+
+  const StartupStrategyOptimizationResult({
+    required this.generatedAt,
+    required this.windowDays,
+    required this.primaryWindowDays,
+    required this.rounds,
+    required this.baselineRound,
+    required this.bestRound,
+    required this.windows,
+    required this.stableRounds,
+    required this.stableBestRound,
+    required this.selectionNote,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'generatedAt': generatedAt.toIso8601String(),
+        'windowDays': windowDays,
+        'primaryWindowDays': primaryWindowDays,
+        'testedRounds': rounds.length,
+        'baselineRound': baselineRound.toJson(),
+        'bestRound': bestRound.toJson(),
+        'stableBestRound': stableBestRound.toJson(),
+        'selectionNote': selectionNote,
+        'windows': windows.map((item) => item.toJson()).toList(),
+        'stableRounds': stableRounds.map((item) => item.toJson()).toList(),
         'rounds': rounds.map((item) => item.toJson()).toList(),
       };
 }

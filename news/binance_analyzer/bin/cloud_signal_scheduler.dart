@@ -19,15 +19,20 @@ class CloudSchedulerConfig {
   final int port;
   final Duration interval;
   final Duration replayMaxAge;
+  final Duration startupStrategyMaxAge;
   final Duration marketSnapshotTtl;
   final Duration newsCacheTtl;
+  final Duration newsSignalInterval;
   final Duration pushDedupeWindow;
   final bool enableMarketStartupScanner;
+  final bool enableNewsSignalPush;
   final int? marketSymbolLimit;
+  final int newsSignalFetchLimit;
   final bool runOnStartup;
   final bool runOnce;
   final bool enableInternalScheduler;
   final bool refreshReplayBeforeRun;
+  final bool refreshStartupStrategyBeforeRun;
   final bool publishPush;
   final bool dedupePush;
   final PushProvider pushProvider;
@@ -37,7 +42,11 @@ class CloudSchedulerConfig {
   final String? ntfyServer;
   final String dailyReportPath;
   final String replayReportPath;
+  final String startupStrategyReportPath;
   final String buyLogPath;
+  final String clientSignalActionPath;
+  final String clientExecutionPath;
+  final String newsPushStatePath;
   final String schedulerStatePath;
   final String pushStatePath;
   final List<String>? watchlistSymbols;
@@ -46,15 +55,20 @@ class CloudSchedulerConfig {
     required this.port,
     required this.interval,
     required this.replayMaxAge,
+    required this.startupStrategyMaxAge,
     required this.marketSnapshotTtl,
     required this.newsCacheTtl,
+    required this.newsSignalInterval,
     required this.pushDedupeWindow,
     required this.enableMarketStartupScanner,
+    required this.enableNewsSignalPush,
     required this.marketSymbolLimit,
+    required this.newsSignalFetchLimit,
     required this.runOnStartup,
     required this.runOnce,
     required this.enableInternalScheduler,
     required this.refreshReplayBeforeRun,
+    required this.refreshStartupStrategyBeforeRun,
     required this.publishPush,
     required this.dedupePush,
     required this.pushProvider,
@@ -64,7 +78,11 @@ class CloudSchedulerConfig {
     required this.ntfyServer,
     required this.dailyReportPath,
     required this.replayReportPath,
+    required this.startupStrategyReportPath,
     required this.buyLogPath,
+    required this.clientSignalActionPath,
+    required this.clientExecutionPath,
+    required this.newsPushStatePath,
     required this.schedulerStatePath,
     required this.pushStatePath,
     required this.watchlistSymbols,
@@ -80,11 +98,18 @@ class CloudSchedulerConfig {
           minutes: int.tryParse(env['SIGNAL_INTERVAL_MINUTES'] ?? '30') ?? 30),
       replayMaxAge: Duration(
           hours: int.tryParse(env['REPLAY_REFRESH_HOURS'] ?? '12') ?? 12),
+      startupStrategyMaxAge: Duration(
+          hours: int.tryParse(env['STARTUP_STRATEGY_REFRESH_HOURS'] ?? '24') ??
+              24),
       marketSnapshotTtl: Duration(
         seconds: int.tryParse(env['MARKET_SNAPSHOT_TTL_SECONDS'] ?? '90') ?? 90,
       ),
       newsCacheTtl: Duration(
         seconds: int.tryParse(env['NEWS_CACHE_TTL_SECONDS'] ?? '180') ?? 180,
+      ),
+      newsSignalInterval: Duration(
+        minutes:
+            int.tryParse(env['NEWS_SIGNAL_INTERVAL_MINUTES'] ?? '120') ?? 120,
       ),
       pushDedupeWindow:
           Duration(hours: int.tryParse(env['PUSH_DEDUPE_HOURS'] ?? '6') ?? 6),
@@ -92,7 +117,13 @@ class CloudSchedulerConfig {
         env['ENABLE_MARKET_STARTUP_SCANNER'],
         fallback: true,
       ),
+      enableNewsSignalPush:
+          _boolFromEnv(env['ENABLE_NEWS_SIGNAL_PUSH'], fallback: true),
       marketSymbolLimit: _intFromEnv(env['MARKET_SYMBOL_LIMIT']),
+      newsSignalFetchLimit:
+          (int.tryParse(env['NEWS_SIGNAL_FETCH_LIMIT'] ?? '16') ?? 16)
+              .clamp(4, 40)
+              .toInt(),
       runOnStartup: _boolFromEnv(env['RUN_ON_STARTUP'], fallback: true),
       runOnce: runOnce,
       enableInternalScheduler: _boolFromEnv(
@@ -101,6 +132,10 @@ class CloudSchedulerConfig {
       ),
       refreshReplayBeforeRun:
           _boolFromEnv(env['REFRESH_REPLAY_BEFORE_RUN'], fallback: true),
+      refreshStartupStrategyBeforeRun: _boolFromEnv(
+        env['REFRESH_STARTUP_STRATEGY_BEFORE_RUN'],
+        fallback: true,
+      ),
       publishPush: _boolFromEnv(env['PUBLISH_PUSH'], fallback: true),
       dedupePush: _boolFromEnv(env['DEDUPE_PUSH'], fallback: true),
       pushProvider: parsePushProvider(env['PUSH_PROVIDER']),
@@ -112,8 +147,16 @@ class CloudSchedulerConfig {
           SignalRunnerService.defaultDailyReportPath,
       replayReportPath: env['REPLAY_REPORT_PATH'] ??
           SignalRunnerService.defaultReplayReportPath,
+      startupStrategyReportPath: env['STARTUP_STRATEGY_REPORT_PATH'] ??
+          SignalRunnerService.defaultStartupStrategyReportPath,
       buyLogPath:
           env['BUY_LOG_PATH'] ?? SignalRunnerService.defaultStartupBuyLogPath,
+      clientSignalActionPath: env['CLIENT_SIGNAL_ACTION_PATH'] ??
+          SignalRunnerService.defaultClientSignalActionLogPath,
+      clientExecutionPath: env['CLIENT_EXECUTION_PATH'] ??
+          SignalRunnerService.defaultClientExecutionCyclePath,
+      newsPushStatePath:
+          env['NEWS_PUSH_STATE_PATH'] ?? 'build/reports/news_push_state.json',
       schedulerStatePath: env['SCHEDULER_STATE_PATH'] ??
           'build/reports/cloud_scheduler_state.json',
       pushStatePath:
@@ -183,6 +226,10 @@ class _CloudSignalSchedulerApp {
   String? _latestNewsKey;
   DateTime? _latestNewsAt;
   Map<String, dynamic>? _latestPredictionLog;
+  Map<String, dynamic>? _latestClientSignalActionLog;
+  Map<String, dynamic>? _latestClientExecutionLog;
+  Map<String, dynamic>? _lastNewsSignal;
+  DateTime? _lastNewsSignalAt;
   PushDeliveryResult? _lastPush;
 
   _CloudSignalSchedulerApp(this.config);
@@ -235,11 +282,21 @@ class _CloudSignalSchedulerApp {
     _latestReport = await _loadIfPresent(config.dailyReportPath);
     _latestReplay = await _loadIfPresent(config.replayReportPath);
     _latestPredictionLog = await _loadIfPresent(config.buyLogPath);
+    _latestClientSignalActionLog =
+        await _loadIfPresent(config.clientSignalActionPath);
+    _latestClientExecutionLog =
+        await _loadIfPresent(config.clientExecutionPath);
     _lastRunAt = DateTime.tryParse(state['lastRunAt'] as String? ?? '');
     _lastStatus = state['lastStatus'] as String? ?? _lastStatus;
     _lastError = state['lastError'] as String?;
     _lastTrigger = state['lastTrigger'] as String?;
     _runCount = state['runCount'] as int? ?? 0;
+    _lastNewsSignalAt =
+        DateTime.tryParse(state['lastNewsSignalAt'] as String? ?? '');
+    final newsSignal = state['lastNewsSignal'];
+    if (newsSignal is Map) {
+      _lastNewsSignal = Map<String, dynamic>.from(newsSignal);
+    }
 
     final push = state['lastPush'];
     if (push is Map) {
@@ -270,6 +327,9 @@ class _CloudSignalSchedulerApp {
           'marketSnapshotEndpoint': '/market-snapshot',
           'newsEndpoint': '/news',
           'predictionStatsEndpoint': '/prediction-stats',
+          'signalActionEndpoint': '/signal-action',
+          'signalActionsEndpoint': '/signal-actions',
+          'executionStatsEndpoint': '/execution-stats',
           'runEndpoint': '/run',
           'pushTestEndpoint': '/push-test',
           'internalScheduler': config.enableInternalScheduler,
@@ -278,6 +338,7 @@ class _CloudSignalSchedulerApp {
           'newsCacheSeconds': config.newsCacheTtl.inSeconds,
           'pushProvider': config.pushProvider.name,
           'effectivePushProvider': _effectivePushProviderName(),
+          'startupStrategyReportPath': config.startupStrategyReportPath,
         });
         return;
       }
@@ -359,6 +420,86 @@ class _CloudSignalSchedulerApp {
         }
         _latestPredictionLog = payload;
         await _writeJson(request.response, HttpStatus.ok, payload);
+        return;
+      }
+
+      if (request.method == 'GET' && path == '/signal-actions') {
+        final limit = _requestedSignalActionLimitFrom(request);
+        final payload = await _service.loadClientSignalActionLog(
+          path: config.clientSignalActionPath,
+          limit: limit,
+        );
+        _latestClientSignalActionLog = payload;
+        await _writeJson(request.response, HttpStatus.ok, payload);
+        return;
+      }
+
+      if (request.method == 'GET' && path == '/execution-stats') {
+        final limit = _requestedSignalActionLimitFrom(request);
+        final payload = await _service.loadClientExecutionLog(
+          path: config.clientExecutionPath,
+          limit: limit,
+        );
+        _latestClientExecutionLog = payload;
+        await _writeJson(request.response, HttpStatus.ok, payload);
+        return;
+      }
+
+      if (request.method == 'POST' && path == '/signal-action') {
+        final body = await _readJsonBody(request);
+        final signalId = body['signalId']?.toString().trim() ?? '';
+        final symbol = body['symbol']?.toString().trim() ?? '';
+        final signalType =
+            body['signalType']?.toString().trim().toLowerCase() ?? '';
+        final actionType =
+            body['actionType']?.toString().trim().toLowerCase() ?? '';
+        final signalSource =
+            body['signalSource']?.toString().trim().toLowerCase() ?? 'feishu';
+
+        if (signalId.isEmpty ||
+            symbol.isEmpty ||
+            signalType.isEmpty ||
+            (actionType != 'confirm' && actionType != 'cancel')) {
+          await _writeJson(request.response, HttpStatus.badRequest, {
+            'error': 'invalid payload',
+            'required': [
+              'signalId',
+              'symbol',
+              'signalType',
+              'actionType(confirm/cancel)',
+            ],
+          });
+          return;
+        }
+
+        final payload = await _service.recordClientSignalAction(
+          path: config.clientSignalActionPath,
+          executionPath: config.clientExecutionPath,
+          signalId: signalId,
+          symbol: symbol,
+          signalType: signalType,
+          signalSource: signalSource,
+          actionType: actionType,
+          price: (body['price'] as num?)?.toDouble() ?? 0,
+          timingLabel: body['timingLabel']?.toString() ?? '',
+          timingReason: body['timingReason']?.toString() ?? '',
+          totalScore: (body['totalScore'] as num?)?.toDouble() ?? 0,
+          entryScore: (body['entryScore'] as num?)?.toDouble() ?? 0,
+          note: body['note']?.toString() ?? '',
+          client: body['client']?.toString() ?? 'app',
+        );
+        _latestClientSignalActionLog = await _service.loadClientSignalActionLog(
+          path: config.clientSignalActionPath,
+        );
+        _latestClientExecutionLog = await _service.loadClientExecutionLog(
+          path: config.clientExecutionPath,
+        );
+        final created = payload['created'] == true;
+        await _writeJson(
+          request.response,
+          created ? HttpStatus.created : HttpStatus.ok,
+          payload,
+        );
         return;
       }
 
@@ -446,6 +587,21 @@ class _CloudSignalSchedulerApp {
     await _saveState();
 
     try {
+      if (config.enableMarketStartupScanner &&
+          config.refreshStartupStrategyBeforeRun) {
+        final strategy = await _service.ensureFreshStartupStrategyReport(
+          startupStrategyReportPath: config.startupStrategyReportPath,
+          maxAge: config.startupStrategyMaxAge,
+          symbolLimit: config.marketSymbolLimit,
+        );
+        stdout.writeln(
+          '[${DateTime.now().toIso8601String()}] startup_strategy '
+          '${strategy.refreshed ? 'refreshed' : 'reused'} '
+          'windows=${strategy.windowDays.join('/')} '
+          'best=${strategy.stableRoundLabel ?? 'unknown'}',
+        );
+      }
+
       if (!config.enableMarketStartupScanner && config.refreshReplayBeforeRun) {
         final replay = await _service.ensureFreshReplayReport(
           requestedSymbols: config.watchlistSymbols,
@@ -466,6 +622,7 @@ class _CloudSignalSchedulerApp {
           symbolLimit: config.marketSymbolLimit,
           reportPath: config.dailyReportPath,
           buyLogPath: config.buyLogPath,
+          startupStrategyReportPath: config.startupStrategyReportPath,
           pushProvider: config.pushProvider,
           feishuWebhookUrl: config.feishuWebhookUrl,
           ntfyTopic: config.ntfyTopic,
@@ -485,11 +642,26 @@ class _CloudSignalSchedulerApp {
         _latestSnapshot = null;
         _latestSnapshotKey = null;
         _latestPredictionLog = result.predictionLog;
+        final watchCount =
+            (result.payload['observationCandidates'] as List<dynamic>? ??
+                    const [])
+                .length;
+        final buyCount =
+            (result.payload['actionableCandidates'] as List<dynamic>? ??
+                    const [])
+                .length;
+        final bottomCount = (result.payload['marketBottomActionableCandidates']
+                    as List<dynamic>? ??
+                const [])
+            .length;
 
         stdout.writeln(
           '[${result.generatedAt.toIso8601String()}] $trigger '
           'mode=market_startup '
-          'candidates=${result.report.actionableCandidates.length} '
+          'watch=$watchCount '
+          'buy=$buyCount '
+          'bottom=$bottomCount '
+          'policy=${result.policySelection.summary} '
           'push=${result.pushResult.status} '
           'provider=${result.pushResult.provider} '
           'message=${result.pushResult.message}',
@@ -526,6 +698,8 @@ class _CloudSignalSchedulerApp {
           'message=${result.pushResult.message}',
         );
       }
+
+      await _maybePublishNewsSignals(trigger: trigger);
     } catch (error, stackTrace) {
       _lastRunAt = DateTime.now();
       _lastStatus = 'error';
@@ -574,15 +748,29 @@ class _CloudSignalSchedulerApp {
           : 'watchlist_rotation',
       'dailyReportPath': config.dailyReportPath,
       'replayReportPath': config.replayReportPath,
+      'startupStrategyReportPath': config.startupStrategyReportPath,
       'buyLogPath': config.buyLogPath,
+      'clientSignalActionPath': config.clientSignalActionPath,
+      'clientExecutionPath': config.clientExecutionPath,
       'marketSnapshotCacheSeconds': config.marketSnapshotTtl.inSeconds,
       'newsCacheSeconds': config.newsCacheTtl.inSeconds,
       'latestSnapshotAt': _latestSnapshot?.updatedAt.toIso8601String(),
       'latestSnapshotSymbols': _latestSnapshot?.watchlistSymbols,
       'latestNewsAt': _latestNewsAt?.toIso8601String(),
       'latestNewsCount': _latestNews?.length,
+      'newsSignalIntervalMinutes': config.newsSignalInterval.inMinutes,
+      'enableNewsSignalPush': config.enableNewsSignalPush,
+      'lastNewsSignalAt': _lastNewsSignalAt?.toIso8601String(),
+      'lastNewsSignal': _lastNewsSignal,
       'startupPredictionSummary': _latestPredictionLog?['summary'],
       'startupPredictionUpdatedAt': _latestPredictionLog?['updatedAt'],
+      'startupPolicySelection': _latestReport?['policySelection'],
+      'clientSignalActionSummary': _latestClientSignalActionLog?['summary'],
+      'clientSignalActionUpdatedAt': _latestClientSignalActionLog?['updatedAt'],
+      'clientExecutionSummary': _latestClientExecutionLog?['summary'],
+      'clientExecutionUpdatedAt': _latestClientExecutionLog?['updatedAt'],
+      'startupMarketRegime':
+          (_latestReport?['report'] as Map?)?['marketRegime'],
       'lastPush': _lastPush?.toJson(),
       'latestTop3': _latestSummaryItems(),
       ..._pushConfigPayload(),
@@ -596,9 +784,24 @@ class _CloudSignalSchedulerApp {
     final actionable = _latestReport?['actionableCandidates'];
     if (actionable is List) return actionable.take(3).toList();
 
+    final observations = _latestReport?['observationCandidates'];
+    if (observations is List) return observations.take(3).toList();
+
+    final marketBottomActionable =
+        _latestReport?['marketBottomActionableCandidates'];
+    if (marketBottomActionable is List) {
+      return marketBottomActionable.take(3).toList();
+    }
+
     final nestedReport = _latestReport?['report'];
     if (nestedReport is Map) {
       final candidates = nestedReport['candidates'];
+      if (candidates is List) return candidates.take(3).toList();
+    }
+
+    final bottomAlert = _latestReport?['marketBottomAlert'];
+    if (bottomAlert is Map) {
+      final candidates = bottomAlert['candidates'];
       if (candidates is List) return candidates.take(3).toList();
     }
 
@@ -611,6 +814,7 @@ class _CloudSignalSchedulerApp {
       'dedupePush': config.dedupePush,
       'pushProvider': config.pushProvider.name,
       'effectivePushProvider': _effectivePushProviderName(),
+      'newsPushStatePath': config.newsPushStatePath,
       'hasRunnerToken': (config.runnerToken?.trim().isNotEmpty ?? false),
       'hasFeishuWebhook': _hasFeishuWebhook(),
       'hasNtfyTopic': _hasNtfyTopic(),
@@ -642,6 +846,105 @@ class _CloudSignalSchedulerApp {
     return Uri.tryParse(raw)?.host;
   }
 
+  Future<void> _maybePublishNewsSignals({required String trigger}) async {
+    if (!config.enableNewsSignalPush) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final isManualTrigger = trigger.startsWith('manual');
+    if (!isManualTrigger &&
+        _lastNewsSignalAt != null &&
+        now.difference(_lastNewsSignalAt!) < config.newsSignalInterval) {
+      return;
+    }
+
+    try {
+      final items = await _loadNewsFeed(
+        limit: config.newsSignalFetchLimit,
+        requestedCategories: const [],
+        forceRefresh: true,
+      );
+      final candidates = _newsService.selectActionableSignals(items);
+      PushDeliveryResult pushResult;
+      if (config.publishPush && candidates.isNotEmpty) {
+        pushResult = await _service.publishTextMessage(
+          provider: config.pushProvider,
+          feishuWebhookUrl: config.feishuWebhookUrl,
+          topic: config.ntfyTopic,
+          server: config.ntfyServer,
+          body: _buildNewsSignalPushBody(candidates),
+          title: 'Binance Analyzer News Signal',
+          dedupe: config.dedupePush,
+          statePath: config.newsPushStatePath,
+          dedupeWindow: config.pushDedupeWindow,
+          dedupeKey: 'major_news_signal',
+          successMessage: '已推送重大资讯信号',
+        );
+      } else {
+        pushResult = PushDeliveryResult(
+          attempted: false,
+          sent: false,
+          provider: _effectivePushProviderName() ?? 'none',
+          status: candidates.isEmpty ? 'skipped_no_actionable' : 'disabled',
+          message: candidates.isEmpty ? '当前没有高确信度的重大资讯信号' : '远程推送已关闭，未发送重大资讯信号',
+          recordedAt: now,
+        );
+      }
+
+      _lastNewsSignalAt = now;
+      _lastNewsSignal = {
+        'checkedAt': now.toIso8601String(),
+        'trigger': trigger,
+        'candidateCount': candidates.length,
+        'items': candidates.map((item) => item.toJson()).toList(),
+        'pushResult': pushResult.toJson(),
+      };
+
+      stdout.writeln(
+        '[${now.toIso8601String()}] news_signal '
+        'candidates=${candidates.length} '
+        'push=${pushResult.status} '
+        'provider=${pushResult.provider}',
+      );
+    } catch (error, stackTrace) {
+      _lastNewsSignalAt = now;
+      _lastNewsSignal = {
+        'checkedAt': now.toIso8601String(),
+        'trigger': trigger,
+        'status': 'error',
+        'message': error.toString(),
+      };
+      stderr.writeln(
+        '[${now.toIso8601String()}] news_signal failed: $error',
+      );
+      stderr.writeln(stackTrace);
+    }
+  }
+
+  String _buildNewsSignalPushBody(List<NewsItem> items) {
+    final buffer = StringBuffer()..writeln('Binance 重大资讯提醒');
+    for (final item in items.take(3)) {
+      final summary = item.displayDetailBody.replaceAll('\n', ' ').trim();
+      final clippedSummary =
+          summary.length <= 120 ? summary : '${summary.substring(0, 120)}...';
+      buffer
+        ..writeln('')
+        ..writeln(
+          '${item.impactDirection == 'bearish' ? '利空' : '利多'} | '
+          '${(item.impactScore * 100).round()}分 | ${item.eventSummary}',
+        )
+        ..writeln(item.displayTitle)
+        ..writeln('来源: ${item.source} | 时间: ${item.timeAgo}')
+        ..writeln(
+          '对象: ${item.relatedSymbols.isEmpty ? '全市场/主流币' : item.relatedSymbols.join(', ')}',
+        )
+        ..writeln('判断: ${item.impactSummary}')
+        ..writeln('摘要: $clippedSummary');
+    }
+    return buffer.toString();
+  }
+
   List<String> _requestedSymbolsFrom(HttpRequest request) {
     final raw = request.uri.queryParameters['symbols'];
     final source = raw == null || raw.trim().isEmpty
@@ -657,6 +960,17 @@ class _CloudSignalSchedulerApp {
     }
     if (parsed > 80) {
       return 80;
+    }
+    return parsed;
+  }
+
+  int _requestedSignalActionLimitFrom(HttpRequest request) {
+    final parsed = int.tryParse(request.uri.queryParameters['limit'] ?? '');
+    if (parsed == null || parsed <= 0) {
+      return 200;
+    }
+    if (parsed > 500) {
+      return 500;
     }
     return parsed;
   }
@@ -791,6 +1105,8 @@ class _CloudSignalSchedulerApp {
         'mode': config.enableMarketStartupScanner
             ? 'market_startup'
             : 'watchlist_rotation',
+        'lastNewsSignalAt': _lastNewsSignalAt?.toIso8601String(),
+        'lastNewsSignal': _lastNewsSignal,
         'lastPush': _lastPush?.toJson(),
       },
     );
@@ -805,5 +1121,21 @@ class _CloudSignalSchedulerApp {
     response.headers.contentType = ContentType.json;
     response.write(const JsonEncoder.withIndent('  ').convert(payload));
     await response.close();
+  }
+
+  Future<Map<String, dynamic>> _readJsonBody(HttpRequest request) async {
+    final raw = await utf8.decoder.bind(request).join();
+    if (raw.trim().isEmpty) {
+      return <String, dynamic>{};
+    }
+
+    final decoded = jsonDecode(raw);
+    if (decoded is Map<String, dynamic>) {
+      return decoded;
+    }
+    if (decoded is Map) {
+      return Map<String, dynamic>.from(decoded);
+    }
+    throw const FormatException('request body must be a JSON object');
   }
 }

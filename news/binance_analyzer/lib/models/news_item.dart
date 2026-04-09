@@ -4,6 +4,12 @@ class NewsItem {
   final String body;
   final String translatedTitle;
   final String translatedBody;
+  final String eventSummary;
+  final String impactSummary;
+  final String impactDirection;
+  final double impactScore;
+  final List<String> relatedSymbols;
+  final bool actionableSignal;
   final String url;
   final String source;
   final String imageUrl;
@@ -17,6 +23,12 @@ class NewsItem {
     required this.body,
     this.translatedTitle = '',
     this.translatedBody = '',
+    this.eventSummary = '',
+    this.impactSummary = '',
+    this.impactDirection = 'neutral',
+    this.impactScore = 0,
+    this.relatedSymbols = const [],
+    this.actionableSignal = false,
     required this.url,
     required this.source,
     required this.imageUrl,
@@ -112,6 +124,14 @@ class NewsItem {
       body: json['body']?.toString() ?? '',
       translatedTitle: json['translatedTitle']?.toString() ?? '',
       translatedBody: json['translatedBody']?.toString() ?? '',
+      eventSummary: json['eventSummary']?.toString() ?? '',
+      impactSummary: json['impactSummary']?.toString() ?? '',
+      impactDirection: json['impactDirection']?.toString() ?? 'neutral',
+      impactScore: (json['impactScore'] as num?)?.toDouble() ?? 0,
+      relatedSymbols: (json['relatedSymbols'] as List<dynamic>? ?? const [])
+          .map((item) => item.toString())
+          .toList(),
+      actionableSignal: json['actionableSignal'] as bool? ?? false,
       url: json['url']?.toString() ?? '',
       source: json['source']?.toString() ?? '',
       imageUrl: json['imageUrl']?.toString() ?? '',
@@ -130,6 +150,12 @@ class NewsItem {
         'body': body,
         'translatedTitle': translatedTitle,
         'translatedBody': translatedBody,
+        'eventSummary': eventSummary,
+        'impactSummary': impactSummary,
+        'impactDirection': impactDirection,
+        'impactScore': impactScore,
+        'relatedSymbols': relatedSymbols,
+        'actionableSignal': actionableSignal,
         'url': url,
         'source': source,
         'imageUrl': imageUrl,
@@ -144,6 +170,12 @@ class NewsItem {
     String? body,
     String? translatedTitle,
     String? translatedBody,
+    String? eventSummary,
+    String? impactSummary,
+    String? impactDirection,
+    double? impactScore,
+    List<String>? relatedSymbols,
+    bool? actionableSignal,
     String? url,
     String? source,
     String? imageUrl,
@@ -157,6 +189,12 @@ class NewsItem {
       body: body ?? this.body,
       translatedTitle: translatedTitle ?? this.translatedTitle,
       translatedBody: translatedBody ?? this.translatedBody,
+      eventSummary: eventSummary ?? this.eventSummary,
+      impactSummary: impactSummary ?? this.impactSummary,
+      impactDirection: impactDirection ?? this.impactDirection,
+      impactScore: impactScore ?? this.impactScore,
+      relatedSymbols: relatedSymbols ?? this.relatedSymbols,
+      actionableSignal: actionableSignal ?? this.actionableSignal,
       url: url ?? this.url,
       source: source ?? this.source,
       imageUrl: imageUrl ?? this.imageUrl,

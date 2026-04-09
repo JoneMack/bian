@@ -266,7 +266,7 @@ class NewsTranslationService {
 
   Future<NewsItem> localizeNewsItem(NewsItem item) async {
     final title = _cleanInput(item.title);
-    final body = _buildSummarySource(item.body, item.title);
+    final body = _buildTranslationSource(item.body, item.title);
 
     if (title.isEmpty && body.isEmpty) return item;
     if (_looksChinese(title) && (body.isEmpty || _looksChinese(body))) {
@@ -435,7 +435,7 @@ class NewsTranslationService {
     if (_isReadableChinese(normalized)) {
       final condensed = _condenseChineseText(
         normalized,
-        maxLength: compact ? 48 : 120,
+        maxLength: compact ? 48 : 480,
         terminate: !compact,
       );
       if (!compact && _hasEnglishNoise(condensed)) {
@@ -489,11 +489,11 @@ class NewsTranslationService {
     return ordered;
   }
 
-  static String _buildSummarySource(String body, String title) {
+  static String _buildTranslationSource(String body, String title) {
     final cleaned = _cleanInput(body);
     if (cleaned.isEmpty || cleaned == _cleanInput(title)) return '';
-    if (cleaned.length <= 180) return cleaned;
-    return '${cleaned.substring(0, 180)}...';
+    if (cleaned.length <= 1400) return cleaned;
+    return '${cleaned.substring(0, 1400)}...';
   }
 
   static String _cleanInput(String text) => _normalizeWhitespace(text);
