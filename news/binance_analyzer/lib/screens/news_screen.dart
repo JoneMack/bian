@@ -44,6 +44,80 @@ class _NewsScreenState extends State<NewsScreen>
     );
   }
 
+  Future<void> _openBackendSettings() async {
+    final controller = TextEditingController(
+      text: _backend.resolvedBaseUrl ?? '',
+    );
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: AppTheme.cardDark,
+          title: const Text(
+            '配置后台地址',
+            style: TextStyle(color: AppTheme.textPrimary),
+          ),
+          content: TextField(
+            controller: controller,
+            keyboardType: TextInputType.url,
+            style: const TextStyle(color: AppTheme.textPrimary),
+            decoration: const InputDecoration(
+              hintText: '例如 http://你的服务器IP',
+              hintStyle: TextStyle(color: AppTheme.textSecondary),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () async {
+                await BackendApiService.clearBaseUrl();
+                if (dialogContext.mounted) {
+                  Navigator.of(dialogContext).pop('');
+                }
+              },
+              child: const Text('清空'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                final raw = controller.text.trim();
+                if (raw.isEmpty) {
+                  if (dialogContext.mounted) {
+                    Navigator.of(dialogContext).pop('');
+                  }
+                  return;
+                }
+                await BackendApiService.saveBaseUrl(raw);
+                if (dialogContext.mounted) {
+                  Navigator.of(dialogContext).pop(raw);
+                }
+              },
+              style: FilledButton.styleFrom(
+                backgroundColor: AppTheme.binanceYellow,
+                foregroundColor: AppTheme.binanceDark,
+              ),
+              child: const Text('保存'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (!mounted || saved == null) return;
+    if (saved.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('已清空后台地址，将使用本地资讯')),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('后台地址已保存')),
+      );
+    }
+    await _load();
+  }
+
   @override
   void dispose() {
     _refreshTimer?.cancel();
@@ -167,6 +241,16 @@ class _NewsScreenState extends State<NewsScreen>
         ],
       ),
       actions: [
+        IconButton(
+          onPressed: _openBackendSettings,
+          icon: Icon(
+            _backend.isConfigured
+                ? Icons.cloud_done_rounded
+                : Icons.cloud_off_rounded,
+            color:
+                _backend.isConfigured ? AppTheme.green : AppTheme.textPrimary,
+          ),
+        ),
         IconButton(
           onPressed: _load,
           icon: _loading

@@ -2,10 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../models/coin_data.dart';
+import '../models/strategy_snapshot.dart';
+import '../services/history_service.dart';
 import '../services/binance_service.dart';
 import '../services/watchlist_service.dart';
 import '../theme/app_theme.dart';
 import '../utils/coin_insight_helper.dart';
+import '../utils/signal_action_helper.dart';
 import 'coin_detail_screen.dart';
 import 'main_nav_screen.dart';
 
@@ -13,16 +16,44 @@ enum SortBy { score, change, volume, name }
 
 enum FilterBy { all, up, down, volume, ready }
 
+typedef SignalActionHandler = Future<void> Function(
+  EntryAlertSignal signal,
+  String signalType,
+  String actionType,
+);
+
+typedef SignalActionStatusResolver = String? Function(
+  EntryAlertSignal signal,
+  String signalType,
+);
+
+typedef SignalActionSubmittingResolver = bool Function(
+  EntryAlertSignal signal,
+  String signalType,
+);
+
 class MarketScreen extends StatefulWidget {
   final MarketState state;
   final Future<void> Function({bool silent}) onRefresh;
   final Future<void> Function(List<String> symbols) onSaveWatchlist;
+  final VoidCallback onOpenWaitingBuys;
+  final int pendingBuyCount;
+  final SignalActionHandler onSignalAction;
+  final List<OpenBuyPosition> openPositions;
+  final SignalActionStatusResolver resolveSignalActionStatus;
+  final SignalActionSubmittingResolver isSignalActionSubmitting;
 
   const MarketScreen({
     super.key,
     required this.state,
     required this.onRefresh,
     required this.onSaveWatchlist,
+    required this.onOpenWaitingBuys,
+    required this.pendingBuyCount,
+    required this.onSignalAction,
+    required this.openPositions,
+    required this.resolveSignalActionStatus,
+    required this.isSignalActionSubmitting,
   });
 
   @override
@@ -138,6 +169,34 @@ class _MarketScreenState extends State<MarketScreen> {
         ],
       ),
       actions: [
+        Padding(
+          padding: const EdgeInsets.only(right: 4),
+          child: Center(
+            child: OutlinedButton.icon(
+              onPressed: widget.onOpenWaitingBuys,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppTheme.binanceYellow,
+                side: BorderSide(
+                  color: AppTheme.binanceYellow.withAlpha(140),
+                ),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                minimumSize: const Size(0, 34),
+              ),
+              icon: const Icon(
+                Icons.pending_actions_rounded,
+                size: 16,
+              ),
+              label: Text(
+                '待买 ${widget.pendingBuyCount > 99 ? '99+' : widget.pendingBuyCount}',
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+        ),
         IconButton(
           onPressed: _openWatchlistManager,
           icon: const Icon(
@@ -285,6 +344,26 @@ class _MarketScreenState extends State<MarketScreen> {
 
   List<Widget> _buildRows(BuildContext context) {
     final rows = _sorted;
+    final buySignalsBySymbol = {
+      for (final signal in widget.state.entryAlerts
+          .where((item) => item.shouldNotify)
+          .where(
+            (item) => widget.resolveSignalActionStatus(item, 'buy') != 'cancel',
+          ))
+        normalizeSignalActionSymbol(signal.symbol): signal,
+    };
+    final sellSignalsBySymbol = {
+      for (final signal
+          in widget.state.exitAlerts.where((item) => item.shouldNotify).where(
+                (item) =>
+                    widget.resolveSignalActionStatus(item, 'sell') != 'cancel',
+              ))
+        normalizeSignalActionSymbol(signal.symbol): signal,
+    };
+    final openPositionsBySymbol = {
+      for (final position in widget.openPositions) position.symbol: position,
+    };
+
     if (rows.isEmpty) {
       return [
         Container(
@@ -304,6 +383,15 @@ class _MarketScreenState extends State<MarketScreen> {
         child: _WatchlistCard(
           coin: coin,
           peers: widget.state.allCoins,
+          buySignal:
+              buySignalsBySymbol[normalizeSignalActionSymbol(coin.symbol)],
+          sellSignal:
+              sellSignalsBySymbol[normalizeSignalActionSymbol(coin.symbol)],
+          openPosition:
+              openPositionsBySymbol[normalizeSignalActionSymbol(coin.symbol)],
+          resolveSignalActionStatus: widget.resolveSignalActionStatus,
+          isSignalActionSubmitting: widget.isSignalActionSubmitting,
+          onSignalAction: widget.onSignalAction,
           onTap: () => Navigator.of(context).push(
             MaterialPageRoute(
               builder: (_) => CoinDetailScreen(
@@ -365,7 +453,7 @@ class _WatchlistHero extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           const Text(
-            '重点查看三个标签：涨跌幅、是否放量、是否即将启动。右上角可以增删自选币，点数卡可直接切筛选。',
+            '重点查看三个标签：涨跌幅、是否放量、是否具备领涨结构。右上角可以增删自选币，点数卡可直接切筛选。',
             style: TextStyle(
               color: AppTheme.textSecondary,
               fontSize: 13,
@@ -393,7 +481,7 @@ class _WatchlistHero extends StatelessWidget {
               const SizedBox(width: 10),
               Expanded(
                 child: _HeroCounter(
-                  label: '启动候选',
+                  label: '领涨候选',
                   value: '$readyCount',
                   onTap: onSelectReady,
                 ),
@@ -472,11 +560,23 @@ class _WatchlistCard extends StatelessWidget {
   final CoinData coin;
   final List<CoinData> peers;
   final VoidCallback onTap;
+  final EntryAlertSignal? buySignal;
+  final EntryAlertSignal? sellSignal;
+  final OpenBuyPosition? openPosition;
+  final SignalActionStatusResolver resolveSignalActionStatus;
+  final SignalActionSubmittingResolver isSignalActionSubmitting;
+  final SignalActionHandler onSignalAction;
 
   const _WatchlistCard({
     required this.coin,
     required this.peers,
     required this.onTap,
+    required this.buySignal,
+    required this.sellSignal,
+    required this.openPosition,
+    required this.resolveSignalActionStatus,
+    required this.isSignalActionSubmitting,
+    required this.onSignalAction,
   });
 
   @override
@@ -491,6 +591,17 @@ class _WatchlistCard extends StatelessWidget {
         : coin.timingLabel == '临近买点'
             ? AppTheme.accentOrange
             : AppTheme.textSecondary;
+    final normalizedSymbol = normalizeSignalActionSymbol(coin.symbol);
+    final hasOpenPosition = openPosition != null;
+    final buyStatus =
+        buySignal == null ? null : resolveSignalActionStatus(buySignal!, 'buy');
+    final sellStatus = sellSignal == null
+        ? null
+        : resolveSignalActionStatus(sellSignal!, 'sell');
+    final showBuyAction =
+        buySignal != null && buyStatus == null && !hasOpenPosition;
+    final showSellAction =
+        sellSignal != null && sellStatus == null && hasOpenPosition;
 
     return Material(
       color: Colors.transparent,
@@ -599,7 +710,7 @@ class _WatchlistCard extends StatelessWidget {
                     const SizedBox(width: 10),
                     Expanded(
                       child: _StatusBadge(
-                        label: '即将启动',
+                        label: '领涨结构',
                         value: preparing ? '较强' : '一般',
                         color: preparing
                             ? AppTheme.accentOrange
@@ -638,10 +749,270 @@ class _WatchlistCard extends StatelessWidget {
                     ),
                   ],
                 ),
+                const SizedBox(height: 14),
+                _CardSignalActionBar(
+                  symbol: normalizedSymbol,
+                  buySignal: buySignal,
+                  sellSignal: sellSignal,
+                  openPosition: openPosition,
+                  buyActionStatus: buyStatus,
+                  sellActionStatus: sellStatus,
+                  showBuyAction: showBuyAction,
+                  showSellAction: showSellAction,
+                  buySubmitting: buySignal != null
+                      ? isSignalActionSubmitting(buySignal!, 'buy')
+                      : false,
+                  sellSubmitting: sellSignal != null
+                      ? isSignalActionSubmitting(sellSignal!, 'sell')
+                      : false,
+                  onConfirmBuy: buySignal == null
+                      ? null
+                      : () => onSignalAction(buySignal!, 'buy', 'confirm'),
+                  onCancelSell: sellSignal == null
+                      ? null
+                      : () => onSignalAction(sellSignal!, 'sell', 'cancel'),
+                ),
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _CardSignalActionBar extends StatelessWidget {
+  final String symbol;
+  final EntryAlertSignal? buySignal;
+  final EntryAlertSignal? sellSignal;
+  final OpenBuyPosition? openPosition;
+  final String? buyActionStatus;
+  final String? sellActionStatus;
+  final bool showBuyAction;
+  final bool showSellAction;
+  final bool buySubmitting;
+  final bool sellSubmitting;
+  final VoidCallback? onConfirmBuy;
+  final VoidCallback? onCancelSell;
+
+  const _CardSignalActionBar({
+    required this.symbol,
+    required this.buySignal,
+    required this.sellSignal,
+    required this.openPosition,
+    required this.buyActionStatus,
+    required this.sellActionStatus,
+    required this.showBuyAction,
+    required this.showSellAction,
+    required this.buySubmitting,
+    required this.sellSubmitting,
+    required this.onConfirmBuy,
+    required this.onCancelSell,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (showBuyAction && buySignal != null) {
+      return _ActionStrip(
+        icon: Icons.pending_actions_rounded,
+        title: '等待确认买入',
+        detail: buySignal!.timingReason,
+        accentColor: AppTheme.green,
+        submitting: buySubmitting,
+        buttonLabel: '等待确认',
+        onPressed: onConfirmBuy,
+      );
+    }
+
+    if (showSellAction && sellSignal != null) {
+      return _ActionStrip(
+        icon: Icons.sell_rounded,
+        title: '收到卖出信号',
+        detail: sellSignal!.timingReason,
+        accentColor: AppTheme.red,
+        submitting: sellSubmitting,
+        buttonLabel: '取消卖出',
+        onPressed: onCancelSell,
+      );
+    }
+
+    if (openPosition != null) {
+      return _PassiveStrip(
+        icon: Icons.inventory_2_rounded,
+        title: '$symbol 持仓中',
+        detail: sellActionStatus == 'cancel'
+            ? '这笔卖出已经取消，继续等待下一次卖出信号。'
+            : '已确认买入，当前等待卖出信号。',
+        accentColor: AppTheme.accentBlue,
+      );
+    }
+
+    if (buyActionStatus == 'confirm') {
+      return const _PassiveStrip(
+        icon: Icons.check_circle_rounded,
+        title: '已买入',
+        detail: '买入动作已记录。',
+        accentColor: AppTheme.green,
+      );
+    }
+
+    if (buyActionStatus == 'cancel' || sellActionStatus == 'cancel') {
+      return const SizedBox.shrink();
+    }
+
+    return _PassiveStrip(
+      icon: Icons.remove_red_eye_rounded,
+      title: '$symbol 继续观察',
+      detail: '当前卡片没有待确认信号，暂时不操作。',
+      accentColor: AppTheme.textSecondary,
+    );
+  }
+}
+
+class _ActionStrip extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String detail;
+  final Color accentColor;
+  final bool submitting;
+  final String buttonLabel;
+  final VoidCallback? onPressed;
+
+  const _ActionStrip({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    required this.accentColor,
+    required this.submitting,
+    required this.buttonLabel,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: accentColor.withAlpha(16),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accentColor.withAlpha(70)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: accentColor, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: accentColor,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  detail,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 11,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          submitting
+              ? SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: accentColor,
+                  ),
+                )
+              : FilledButton(
+                  onPressed: onPressed,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: accentColor,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(0, 38),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                  ),
+                  child: Text(
+                    buttonLabel,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PassiveStrip extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String detail;
+  final Color accentColor;
+
+  const _PassiveStrip({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    required this.accentColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: accentColor.withAlpha(12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accentColor.withAlpha(40)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: accentColor, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: accentColor,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  detail,
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 11,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

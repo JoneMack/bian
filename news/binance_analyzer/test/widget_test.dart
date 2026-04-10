@@ -6,6 +6,7 @@ import 'package:binance_analyzer/models/coin_data.dart';
 import 'package:binance_analyzer/models/strategy_snapshot.dart';
 import 'package:binance_analyzer/screens/main_nav_screen.dart';
 import 'package:binance_analyzer/screens/picks_screen.dart';
+import 'package:binance_analyzer/services/history_service.dart';
 import 'package:binance_analyzer/theme/app_theme.dart';
 
 void main() {
@@ -121,16 +122,32 @@ void main() {
             String signalType,
           ) =>
               false,
+          onOpenBackendSettings: () {},
+          onOpenWaitingBuys: () {},
+          backendConfigured: true,
+          pendingBuyCount: 1,
+          openPositions: [
+            OpenBuyPosition(
+              symbol: 'TON',
+              entryPrice: 5.42,
+              boughtAt: DateTime(2026, 4, 2, 9),
+              timingLabel: '已确认买入',
+              timingReason: '收到飞书买入信号后已记录',
+              totalScore: 0.72,
+              entryScore: 0.61,
+              signalId: '2026-04-02|buy|TON|可入场',
+            ),
+          ],
         ),
       ),
     );
 
-    expect(find.text('今日精选'), findsOneWidget);
-    expect(find.text('AI 智能推荐 · 每日3个'), findsOneWidget);
+    expect(find.text('领涨预测'), findsOneWidget);
+    expect(find.text('下一根币安日线 · Top3 候选'), findsOneWidget);
     expect(find.text('飞书信号待处理'), findsOneWidget);
-    expect(find.text('今日推荐买入'), findsOneWidget);
+    expect(find.text('下一根日线领涨预测'), findsOneWidget);
     expect(find.text('FET'), findsWidgets);
     expect(find.text('确定'), findsOneWidget);
-    expect(find.text('取消'), findsOneWidget);
+    expect(find.text('取消'), findsWidgets);
   });
 }

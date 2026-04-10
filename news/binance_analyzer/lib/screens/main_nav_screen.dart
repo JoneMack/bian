@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/coin_data.dart';
 import '../models/market_snapshot.dart';
@@ -97,6 +98,7 @@ class _MainNavScreenState extends State<MainNavScreen> {
   StreamSubscription<PriceUpdate>? _priceSub;
   final Map<String, PriceUpdate> _pendingPriceUpdates = {};
   Map<String, String> _signalActionStatuses = {};
+  List<OpenBuyPosition> _openBuyPositions = const [];
   final Set<String> _submittingSignalIds = <String>{};
   bool _refreshInFlight = false;
   bool _refreshQueued = false;
@@ -106,6 +108,7 @@ class _MainNavScreenState extends State<MainNavScreen> {
     super.initState();
     unawaited(_notifications.requestPermissions());
     unawaited(_loadSignalActionStatuses());
+    unawaited(_loadOpenBuyPositions());
     _loadFull();
     _fullRefreshTimer = Timer.periodic(
       _fullRefreshInterval,
@@ -128,6 +131,14 @@ class _MainNavScreenState extends State<MainNavScreen> {
     if (!mounted) return;
     setState(() {
       _signalActionStatuses = cached;
+    });
+  }
+
+  Future<void> _loadOpenBuyPositions() async {
+    final cached = await _history.loadOpenBuyPositions();
+    if (!mounted) return;
+    setState(() {
+      _openBuyPositions = cached;
     });
   }
 
@@ -162,13 +173,18 @@ class _MainNavScreenState extends State<MainNavScreen> {
     }
 
     if (!_backendApi.isConfigured) {
-      _showSignalActionMessage('当前未连接后台，暂时无法回传统计');
+      _showSignalActionMessage('请先配置后台地址');
+      await _openBackendSettings();
       return;
     }
 
+    await HapticFeedback.selectionClick();
     setState(() {
       _submittingSignalIds.add(signalId);
     });
+    _showSignalActionMessage(
+      actionType == 'confirm' ? '正在提交买入确认...' : '正在提交卖出取消...',
+    );
 
     try {
       final result = await _backendApi.submitSignalAction(
@@ -187,10 +203,30 @@ class _MainNavScreenState extends State<MainNavScreen> {
       final nextStatuses = Map<String, String>.from(_signalActionStatuses)
         ..[signalId] = actionType;
       await _history.saveSignalActionStatuses(nextStatuses);
+      if (signalType == 'buy' && actionType == 'confirm') {
+        await _history.upsertOpenBuyPosition(
+          OpenBuyPosition(
+            symbol: normalizeSignalActionSymbol(signal.symbol),
+            entryPrice: signal.currentPrice,
+            boughtAt: _state.updatedAt,
+            timingLabel: signal.timingLabel,
+            timingReason: signal.timingReason,
+            totalScore: signal.totalScore,
+            entryScore: signal.entryScore,
+            signalId: signalId,
+          ),
+        );
+      } else if (signalType == 'sell' && actionType == 'cancel') {
+        await _history.removeOpenBuyPosition(
+          normalizeSignalActionSymbol(signal.symbol),
+        );
+      }
+      final nextPositions = await _history.loadOpenBuyPositions();
 
       if (!mounted) return;
       setState(() {
         _signalActionStatuses = nextStatuses;
+        _openBuyPositions = nextPositions;
       });
       _showSignalActionMessage(
         result.created ? '已记录到后台统计' : '这条信号今天已经记录过了',
@@ -212,6 +248,178 @@ class _MainNavScreenState extends State<MainNavScreen> {
       SnackBar(content: Text(message)),
     );
   }
+
+  Future<void> _openBackendSettings() async {
+    final controller = TextEditingController(
+      text: _backendApi.resolvedBaseUrl ?? '',
+    );
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: AppTheme.cardDark,
+          title: const Text(
+            '配置后台地址',
+            style: TextStyle(color: AppTheme.textPrimary),
+          ),
+          content: TextField(
+            controller: controller,
+            keyboardType: TextInputType.url,
+            style: const TextStyle(color: AppTheme.textPrimary),
+            decoration: const InputDecoration(
+              hintText: '例如 http://你的服务器IP',
+              hintStyle: TextStyle(color: AppTheme.textSecondary),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () async {
+                await BackendApiService.clearBaseUrl();
+                if (dialogContext.mounted) {
+                  Navigator.of(dialogContext).pop('');
+                }
+              },
+              child: const Text('清空'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                final raw = controller.text.trim();
+                if (raw.isEmpty) {
+                  if (dialogContext.mounted) {
+                    Navigator.of(dialogContext).pop('');
+                  }
+                  return;
+                }
+                await BackendApiService.saveBaseUrl(raw);
+                if (dialogContext.mounted) {
+                  Navigator.of(dialogContext).pop(raw);
+                }
+              },
+              style: FilledButton.styleFrom(
+                backgroundColor: AppTheme.binanceYellow,
+                foregroundColor: AppTheme.binanceDark,
+              ),
+              child: const Text('保存'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (!mounted || saved == null) return;
+    if (saved.isEmpty) {
+      _showSignalActionMessage('已清空后台地址，将使用本地模式');
+      return;
+    }
+
+    _showSignalActionMessage('后台地址已保存');
+    await _loadFull(silent: true);
+  }
+
+  Future<void> _openWaitingBuySheet() async {
+    final pendingBuySignals = statePendingBuySignals;
+    final openPositions = _openBuyPositions;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Container(
+            decoration: const BoxDecoration(
+              color: AppTheme.cardDark,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: AppTheme.cardLight,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    '等待买入 / 已买入',
+                    style: TextStyle(
+                      color: AppTheme.textPrimary,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '等待买入 ${pendingBuySignals.length} 个',
+                    style: const TextStyle(
+                      color: AppTheme.binanceYellow,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  if (pendingBuySignals.isEmpty)
+                    const Text(
+                      '当前没有待确认买入信号',
+                      style: TextStyle(color: AppTheme.textSecondary),
+                    )
+                  else
+                    ...pendingBuySignals.take(5).map(
+                          (signal) => _WaitingSignalRow(
+                            symbol: normalizeSignalActionSymbol(signal.symbol),
+                            subtitle: signal.timingReason,
+                            trailing:
+                                '参考 ${signal.currentPrice.toStringAsFixed(signal.currentPrice >= 1 ? 4 : 6)}',
+                          ),
+                        ),
+                  const SizedBox(height: 16),
+                  Text(
+                    '已买入待卖 ${openPositions.length} 个',
+                    style: const TextStyle(
+                      color: AppTheme.green,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  if (openPositions.isEmpty)
+                    const Text(
+                      '当前没有已确认买入的持仓',
+                      style: TextStyle(color: AppTheme.textSecondary),
+                    )
+                  else
+                    ...openPositions.take(8).map(
+                          (position) => _WaitingSignalRow(
+                            symbol: position.symbol,
+                            subtitle: '买入理由：${position.timingReason}',
+                            trailing:
+                                '买入 ${position.entryPrice.toStringAsFixed(position.entryPrice >= 1 ? 4 : 6)}',
+                          ),
+                        ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  List<EntryAlertSignal> get statePendingBuySignals => _state.entryAlerts
+      .where((item) => item.shouldNotify)
+      .where((item) => _signalActionStatusOf(item, 'buy') != 'confirm')
+      .take(5)
+      .toList();
 
   Future<void> _loadFull({bool silent = false}) async {
     if (_refreshInFlight) {
@@ -416,6 +624,11 @@ class _MainNavScreenState extends State<MainNavScreen> {
         state: _state,
         onRefresh: _loadFull,
         onSignalAction: _submitSignalAction,
+        onOpenBackendSettings: _openBackendSettings,
+        onOpenWaitingBuys: _openWaitingBuySheet,
+        pendingBuyCount: statePendingBuySignals.length,
+        backendConfigured: _backendApi.isConfigured,
+        openPositions: _openBuyPositions,
         resolveSignalActionStatus: _signalActionStatusOf,
         isSignalActionSubmitting: _isSignalActionSubmitting,
       ),
@@ -423,6 +636,12 @@ class _MainNavScreenState extends State<MainNavScreen> {
         state: _state,
         onRefresh: _loadFull,
         onSaveWatchlist: _saveWatchlist,
+        onOpenWaitingBuys: _openWaitingBuySheet,
+        pendingBuyCount: statePendingBuySignals.length,
+        onSignalAction: _submitSignalAction,
+        openPositions: _openBuyPositions,
+        resolveSignalActionStatus: _signalActionStatusOf,
+        isSignalActionSubmitting: _isSignalActionSubmitting,
       ),
       const HistoryScreen(),
       const NewsScreen(),
@@ -499,6 +718,64 @@ class _MainNavScreenState extends State<MainNavScreen> {
           const BottomNavigationBarItem(
             icon: Icon(Icons.newspaper_rounded),
             label: '资讯',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WaitingSignalRow extends StatelessWidget {
+  final String symbol;
+  final String subtitle;
+  final String trailing;
+
+  const _WaitingSignalRow({
+    required this.symbol,
+    required this.subtitle,
+    required this.trailing,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppTheme.cardLight,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  symbol,
+                  style: const TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  subtitle,
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            trailing,
+            style: const TextStyle(
+              color: AppTheme.textSecondary,
+              fontSize: 12,
+            ),
           ),
         ],
       ),

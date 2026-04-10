@@ -12,6 +12,7 @@ class HistoryService {
   static const _replayKey = 'hourly_replay_report_v1';
   static const _policyKey = 'entry_signal_policy_v1';
   static const _signalActionStatusKey = 'signal_action_status_v1';
+  static const _openBuyPositionKey = 'open_buy_positions_v1';
 
   // ── 读取历史 ──────────────────────────────────────
   Future<List<DailyRecommendation>> loadHistory() async {
@@ -323,6 +324,55 @@ class HistoryService {
     await prefs.setString(_signalActionStatusKey, jsonEncode(limited));
   }
 
+  Future<List<OpenBuyPosition>> loadOpenBuyPositions() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_openBuyPositionKey);
+    if (raw == null || raw.isEmpty) return const <OpenBuyPosition>[];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const <OpenBuyPosition>[];
+      return decoded
+          .map((item) => OpenBuyPosition.fromJson(item as Map<String, dynamic>))
+          .toList()
+        ..sort((a, b) => b.boughtAt.compareTo(a.boughtAt));
+    } catch (_) {
+      return const <OpenBuyPosition>[];
+    }
+  }
+
+  Future<void> saveOpenBuyPositions(List<OpenBuyPosition> positions) async {
+    final prefs = await SharedPreferences.getInstance();
+    final normalized = {
+      for (final item in positions.where((item) => item.symbol.trim().isNotEmpty))
+        item.symbol.trim().toUpperCase(): item,
+    }.values.toList()
+      ..sort((a, b) => b.boughtAt.compareTo(a.boughtAt));
+    await prefs.setString(
+      _openBuyPositionKey,
+      jsonEncode(normalized.map((item) => item.toJson()).toList()),
+    );
+  }
+
+  Future<void> upsertOpenBuyPosition(OpenBuyPosition position) async {
+    final positions = await loadOpenBuyPositions();
+    final next = <String, OpenBuyPosition>{
+      for (final item in positions) item.symbol.toUpperCase(): item,
+      position.symbol.toUpperCase(): position,
+    };
+    await saveOpenBuyPositions(next.values.toList());
+  }
+
+  Future<void> removeOpenBuyPosition(String symbol) async {
+    final normalized = symbol.trim().toUpperCase();
+    if (normalized.isEmpty) return;
+    final positions = await loadOpenBuyPositions();
+    await saveOpenBuyPositions(
+      positions
+          .where((item) => item.symbol.toUpperCase() != normalized)
+          .toList(),
+    );
+  }
+
   static DateTime _dateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
 
   String _pickKey(PickRecord pick) =>
@@ -374,4 +424,51 @@ class HistoryService {
 
     return picks;
   }
+}
+
+class OpenBuyPosition {
+  final String symbol;
+  final double entryPrice;
+  final DateTime boughtAt;
+  final String timingLabel;
+  final String timingReason;
+  final double totalScore;
+  final double entryScore;
+  final String signalId;
+
+  const OpenBuyPosition({
+    required this.symbol,
+    required this.entryPrice,
+    required this.boughtAt,
+    required this.timingLabel,
+    required this.timingReason,
+    required this.totalScore,
+    required this.entryScore,
+    required this.signalId,
+  });
+
+  factory OpenBuyPosition.fromJson(Map<String, dynamic> json) {
+    return OpenBuyPosition(
+      symbol: json['symbol']?.toString().trim().toUpperCase() ?? '',
+      entryPrice: (json['entryPrice'] as num?)?.toDouble() ?? 0,
+      boughtAt: DateTime.tryParse(json['boughtAt']?.toString() ?? '') ??
+          DateTime.now(),
+      timingLabel: json['timingLabel']?.toString() ?? '',
+      timingReason: json['timingReason']?.toString() ?? '',
+      totalScore: (json['totalScore'] as num?)?.toDouble() ?? 0,
+      entryScore: (json['entryScore'] as num?)?.toDouble() ?? 0,
+      signalId: json['signalId']?.toString() ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'symbol': symbol,
+        'entryPrice': entryPrice,
+        'boughtAt': boughtAt.toIso8601String(),
+        'timingLabel': timingLabel,
+        'timingReason': timingReason,
+        'totalScore': totalScore,
+        'entryScore': entryScore,
+        'signalId': signalId,
+      };
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../models/coin_data.dart';
 import '../models/strategy_snapshot.dart';
+import '../services/history_service.dart';
 import '../theme/app_theme.dart';
 import '../utils/signal_action_helper.dart';
 import 'main_nav_screen.dart';
@@ -22,11 +23,16 @@ typedef SignalActionSubmittingResolver = bool Function(
   String signalType,
 );
 
-/// 今日精选 3 个 —— 首页 Tab
+/// 下一根日线领涨预测 —— 首页 Tab
 class PicksScreen extends StatelessWidget {
   final MarketState state;
   final Future<void> Function({bool silent}) onRefresh;
   final SignalActionHandler onSignalAction;
+  final VoidCallback onOpenBackendSettings;
+  final VoidCallback onOpenWaitingBuys;
+  final bool backendConfigured;
+  final int pendingBuyCount;
+  final List<OpenBuyPosition> openPositions;
   final SignalActionStatusResolver resolveSignalActionStatus;
   final SignalActionSubmittingResolver isSignalActionSubmitting;
 
@@ -35,6 +41,11 @@ class PicksScreen extends StatelessWidget {
     required this.state,
     required this.onRefresh,
     required this.onSignalAction,
+    required this.onOpenBackendSettings,
+    required this.onOpenWaitingBuys,
+    required this.backendConfigured,
+    required this.pendingBuyCount,
+    required this.openPositions,
     required this.resolveSignalActionStatus,
     required this.isSignalActionSubmitting,
   });
@@ -95,12 +106,12 @@ class PicksScreen extends StatelessWidget {
           const Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('今日精选',
+              Text('领涨预测',
                   style: TextStyle(
                       color: AppTheme.textPrimary,
                       fontSize: 18,
                       fontWeight: FontWeight.bold)),
-              Text('AI 智能推荐 · 每日3个',
+              Text('下一根币安日线 · Top3 候选',
                   style:
                       TextStyle(color: AppTheme.textSecondary, fontSize: 11)),
             ],
@@ -108,6 +119,34 @@ class PicksScreen extends StatelessWidget {
         ],
       ),
       actions: [
+        Padding(
+          padding: const EdgeInsets.only(right: 4),
+          child: Center(
+            child: OutlinedButton.icon(
+              onPressed: onOpenWaitingBuys,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppTheme.binanceYellow,
+                side: BorderSide(
+                  color: AppTheme.binanceYellow.withAlpha(140),
+                ),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                minimumSize: const Size(0, 34),
+              ),
+              icon: const Icon(
+                Icons.pending_actions_rounded,
+                size: 16,
+              ),
+              label: Text(
+                '待买 ${pendingBuyCount > 99 ? '99+' : pendingBuyCount}',
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+        ),
         if (!state.loading)
           Padding(
             padding: const EdgeInsets.only(right: 4),
@@ -119,6 +158,15 @@ class PicksScreen extends StatelessWidget {
               ),
             ),
           ),
+        IconButton(
+          onPressed: onOpenBackendSettings,
+          icon: Icon(
+            backendConfigured
+                ? Icons.cloud_done_rounded
+                : Icons.cloud_off_rounded,
+            color: backendConfigured ? AppTheme.green : AppTheme.textSecondary,
+          ),
+        ),
         IconButton(
           onPressed: () => onRefresh(),
           icon: state.loading
@@ -198,12 +246,20 @@ class PicksScreen extends StatelessWidget {
   }
 
   Widget _buildSignalActionSection() {
-    final buySignals =
-        state.entryAlerts.where((item) => item.shouldNotify).take(3).toList();
-    final sellSignals =
-        state.exitAlerts.where((item) => item.shouldNotify).take(3).toList();
+    final buySignals = state.entryAlerts
+        .where((item) => item.shouldNotify)
+        .where((item) => resolveSignalActionStatus(item, 'buy') == null)
+        .take(3)
+        .toList();
+    final sellSignalsBySymbol = {
+      for (final item in state.exitAlerts
+          .where((item) => item.shouldNotify)
+          .where((item) => resolveSignalActionStatus(item, 'sell') != 'cancel'))
+        normalizeSignalActionSymbol(item.symbol): item,
+    };
+    final trackedPositions = openPositions.take(3).toList();
 
-    if (buySignals.isEmpty && sellSignals.isEmpty) {
+    if (buySignals.isEmpty && trackedPositions.isEmpty) {
       return const SizedBox.shrink();
     }
 
@@ -262,19 +318,41 @@ class PicksScreen extends StatelessWidget {
                 ),
               ),
             ),
-            ...sellSignals.map(
-              (signal) => Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: _SignalActionTile(
-                  signal: signal,
-                  signalType: 'sell',
-                  actionText: '取消',
-                  accentColor: AppTheme.red,
-                  actionStatus: resolveSignalActionStatus(signal, 'sell'),
-                  submitting: isSignalActionSubmitting(signal, 'sell'),
-                  onPressed: () => onSignalAction(signal, 'sell', 'cancel'),
-                ),
-              ),
+            ...trackedPositions.map(
+              (position) {
+                final signal = sellSignalsBySymbol[position.symbol];
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: _SignalActionTile(
+                    signal: signal ??
+                        EntryAlertSignal(
+                          symbol: position.symbol,
+                          timingLabel: '等待卖出',
+                          timingReason: '已买入，等待飞书推送对应卖出信号。',
+                          currentPrice: position.entryPrice,
+                          dayChangePercent: 0,
+                          totalScore: position.totalScore,
+                          entryScore: position.entryScore,
+                          volumeRatio: 0,
+                          breakoutDistance: 0,
+                          pullbackPercent: 0,
+                          shouldNotify: false,
+                        ),
+                    signalType: 'sell',
+                    actionText: signal == null ? '等待中' : '取消',
+                    accentColor: AppTheme.red,
+                    actionStatus: signal == null
+                        ? 'holding'
+                        : resolveSignalActionStatus(signal, 'sell'),
+                    submitting: signal == null
+                        ? false
+                        : isSignalActionSubmitting(signal, 'sell'),
+                    onPressed: signal == null
+                        ? null
+                        : () => onSignalAction(signal, 'sell', 'cancel'),
+                  ),
+                );
+              },
             ),
           ],
         ),
@@ -284,6 +362,21 @@ class PicksScreen extends StatelessWidget {
 
   Widget _buildTop3Section() {
     final picks = state.top3;
+    final buySignalsBySymbol = {
+      for (final signal in state.entryAlerts
+          .where((item) => item.shouldNotify)
+          .where((item) => resolveSignalActionStatus(item, 'buy') != 'cancel'))
+        normalizeSignalActionSymbol(signal.symbol): signal,
+    };
+    final sellSignalsBySymbol = {
+      for (final signal in state.exitAlerts
+          .where((item) => item.shouldNotify)
+          .where((item) => resolveSignalActionStatus(item, 'sell') != 'cancel'))
+        normalizeSignalActionSymbol(signal.symbol): signal,
+    };
+    final openPositionsBySymbol = {
+      for (final position in openPositions) position.symbol: position,
+    };
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -300,7 +393,7 @@ class PicksScreen extends StatelessWidget {
                       color: AppTheme.binanceYellow,
                       borderRadius: BorderRadius.circular(2))),
               const SizedBox(width: 8),
-              const Text('今日推荐买入',
+              const Text('下一根日线领涨预测',
                   style: TextStyle(
                       color: AppTheme.textPrimary,
                       fontSize: 17,
@@ -331,7 +424,19 @@ class PicksScreen extends StatelessWidget {
               picks.length,
               (i) => Padding(
                 padding: const EdgeInsets.only(bottom: 12),
-                child: _BigPickCard(coin: picks[i], rank: i + 1),
+                child: _BigPickCard(
+                  coin: picks[i],
+                  rank: i + 1,
+                  buySignal: buySignalsBySymbol[
+                      normalizeSignalActionSymbol(picks[i].symbol)],
+                  sellSignal: sellSignalsBySymbol[
+                      normalizeSignalActionSymbol(picks[i].symbol)],
+                  openPosition: openPositionsBySymbol[
+                      normalizeSignalActionSymbol(picks[i].symbol)],
+                  resolveSignalActionStatus: resolveSignalActionStatus,
+                  isSignalActionSubmitting: isSignalActionSubmitting,
+                  onSignalAction: onSignalAction,
+                ),
               ),
             ),
 
@@ -378,15 +483,15 @@ class PicksScreen extends StatelessWidget {
         child: const Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('📊 评分算法说明',
+            Text('📊 领涨模型说明',
                 style: TextStyle(
                     color: AppTheme.textPrimary,
                     fontSize: 13,
                     fontWeight: FontWeight.bold)),
             SizedBox(height: 8),
-            _AlgoRow('动量分 (45%)', '24h涨幅在+1%~+8%得分最高'),
-            _AlgoRow('位置分 (30%)', '价格在24h区间越低，上涨空间越大'),
-            _AlgoRow('成交量 (25%)', '成交额越高，信号越可靠'),
+            _AlgoRow('相对动量 (35%)', '比较 7d / 14d / 21d 强弱，14d 权重最高'),
+            _AlgoRow('趋势确认 (20%)', '优先 close > SMA10 > SMA20 的顺势结构'),
+            _AlgoRow('低波动 + 量能', '低波动更优，3d/10d 量比处于健康区间更加分'),
           ],
         ),
       ),
@@ -428,7 +533,7 @@ class _SignalActionTile extends StatelessWidget {
   final Color accentColor;
   final String? actionStatus;
   final bool submitting;
-  final VoidCallback onPressed;
+  final VoidCallback? onPressed;
 
   const _SignalActionTile({
     required this.signal,
@@ -444,7 +549,9 @@ class _SignalActionTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final statusText = actionStatus == null
         ? null
-        : buildSignalActionStatusLabel(actionStatus!);
+        : actionStatus == 'holding'
+            ? '持仓中'
+            : buildSignalActionStatusLabel(actionStatus!);
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -584,8 +691,23 @@ class _SignalActionTile extends StatelessWidget {
 class _BigPickCard extends StatelessWidget {
   final CoinData coin;
   final int rank;
+  final EntryAlertSignal? buySignal;
+  final EntryAlertSignal? sellSignal;
+  final OpenBuyPosition? openPosition;
+  final SignalActionStatusResolver resolveSignalActionStatus;
+  final SignalActionSubmittingResolver isSignalActionSubmitting;
+  final SignalActionHandler onSignalAction;
 
-  const _BigPickCard({required this.coin, required this.rank});
+  const _BigPickCard({
+    required this.coin,
+    required this.rank,
+    required this.buySignal,
+    required this.sellSignal,
+    required this.openPosition,
+    required this.resolveSignalActionStatus,
+    required this.isSignalActionSubmitting,
+    required this.onSignalAction,
+  });
 
   Color get _accentColor => rank == 1
       ? AppTheme.strongBuyColor
@@ -603,6 +725,16 @@ class _BigPickCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final chg = coin.priceChangePercent;
     final isUp = chg >= 0;
+    final buyStatus =
+        buySignal == null ? null : resolveSignalActionStatus(buySignal!, 'buy');
+    final sellStatus = sellSignal == null
+        ? null
+        : resolveSignalActionStatus(sellSignal!, 'sell');
+    final hasOpenPosition = openPosition != null;
+    final showBuyAction =
+        buySignal != null && buyStatus == null && !hasOpenPosition;
+    final showSellAction =
+        sellSignal != null && sellStatus == null && hasOpenPosition;
 
     return Container(
       decoration: BoxDecoration(
@@ -791,6 +923,29 @@ class _BigPickCard extends StatelessWidget {
                     ),
                   ),
                 ],
+                const SizedBox(height: 12),
+                _BigCardActionBar(
+                  coin: coin,
+                  buySignal: buySignal,
+                  sellSignal: sellSignal,
+                  openPosition: openPosition,
+                  buyActionStatus: buyStatus,
+                  sellActionStatus: sellStatus,
+                  showBuyAction: showBuyAction,
+                  showSellAction: showSellAction,
+                  buySubmitting: buySignal != null
+                      ? isSignalActionSubmitting(buySignal!, 'buy')
+                      : false,
+                  sellSubmitting: sellSignal != null
+                      ? isSignalActionSubmitting(sellSignal!, 'sell')
+                      : false,
+                  onConfirmBuy: buySignal == null
+                      ? null
+                      : () => onSignalAction(buySignal!, 'buy', 'confirm'),
+                  onCancelSell: sellSignal == null
+                      ? null
+                      : () => onSignalAction(sellSignal!, 'sell', 'cancel'),
+                ),
               ],
             ),
           ),
@@ -811,6 +966,245 @@ class _BigPickCard extends StatelessWidget {
     if (v >= 1e6) return '${(v / 1e6).toStringAsFixed(1)}M';
     if (v >= 1e3) return '${(v / 1e3).toStringAsFixed(1)}K';
     return v.toStringAsFixed(0);
+  }
+}
+
+class _BigCardActionBar extends StatelessWidget {
+  final CoinData coin;
+  final EntryAlertSignal? buySignal;
+  final EntryAlertSignal? sellSignal;
+  final OpenBuyPosition? openPosition;
+  final String? buyActionStatus;
+  final String? sellActionStatus;
+  final bool showBuyAction;
+  final bool showSellAction;
+  final bool buySubmitting;
+  final bool sellSubmitting;
+  final VoidCallback? onConfirmBuy;
+  final VoidCallback? onCancelSell;
+
+  const _BigCardActionBar({
+    required this.coin,
+    required this.buySignal,
+    required this.sellSignal,
+    required this.openPosition,
+    required this.buyActionStatus,
+    required this.sellActionStatus,
+    required this.showBuyAction,
+    required this.showSellAction,
+    required this.buySubmitting,
+    required this.sellSubmitting,
+    required this.onConfirmBuy,
+    required this.onCancelSell,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (showBuyAction && buySignal != null) {
+      return _BigCardActionBox(
+        icon: Icons.pending_actions_rounded,
+        title: '等待确认买入',
+        detail: buySignal!.timingReason,
+        accentColor: AppTheme.green,
+        buttonText: '等待确认',
+        submitting: buySubmitting,
+        onPressed: onConfirmBuy,
+      );
+    }
+
+    if (showSellAction && sellSignal != null) {
+      return _BigCardActionBox(
+        icon: Icons.sell_rounded,
+        title: '收到卖出提醒',
+        detail: sellSignal!.timingReason,
+        accentColor: AppTheme.red,
+        buttonText: '取消卖出',
+        submitting: sellSubmitting,
+        onPressed: onCancelSell,
+      );
+    }
+
+    if (openPosition != null) {
+      return _BigCardPassiveBox(
+        icon: Icons.inventory_2_rounded,
+        title: '${coin.displayName} 已买入',
+        detail: sellActionStatus == 'cancel'
+            ? '上一条卖出已取消，继续持仓等待下一次卖点。'
+            : '当前持仓中，等待后台给出卖出信号。',
+        accentColor: AppTheme.accentBlue,
+      );
+    }
+
+    if (buyActionStatus == 'confirm') {
+      return const _BigCardPassiveBox(
+        icon: Icons.check_circle_rounded,
+        title: '已记录买入',
+        detail: '这条买入动作已经同步到后台。',
+        accentColor: AppTheme.green,
+      );
+    }
+
+    if (buyActionStatus == 'cancel' || sellActionStatus == 'cancel') {
+      return const SizedBox.shrink();
+    }
+
+    return const _BigCardPassiveBox(
+      icon: Icons.hourglass_bottom_rounded,
+      title: '继续等待',
+      detail: '当前没有需要你确认的操作，宁可不买。',
+      accentColor: AppTheme.textSecondary,
+    );
+  }
+}
+
+class _BigCardActionBox extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String detail;
+  final Color accentColor;
+  final String buttonText;
+  final bool submitting;
+  final VoidCallback? onPressed;
+
+  const _BigCardActionBox({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    required this.accentColor,
+    required this.buttonText,
+    required this.submitting,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: accentColor.withAlpha(14),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: accentColor.withAlpha(70)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: accentColor, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: accentColor,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  detail,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 11,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          submitting
+              ? SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: accentColor,
+                  ),
+                )
+              : FilledButton(
+                  onPressed: onPressed,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: accentColor,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(0, 38),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                  ),
+                  child: Text(
+                    buttonText,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BigCardPassiveBox extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String detail;
+  final Color accentColor;
+
+  const _BigCardPassiveBox({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    required this.accentColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: accentColor.withAlpha(12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: accentColor.withAlpha(36)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: accentColor, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: accentColor,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  detail,
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 11,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

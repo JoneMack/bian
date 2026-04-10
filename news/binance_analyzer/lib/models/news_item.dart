@@ -58,13 +58,25 @@ class NewsItem {
       translatedTitle.isNotEmpty ? translatedTitle : title;
 
   String get displaySummary {
-    final text = translatedBody.isNotEmpty ? translatedBody : summary;
+    final text = impactSummary.trim().isNotEmpty
+        ? impactSummary.trim()
+        : translatedBody.isNotEmpty
+            ? translatedBody
+            : summary;
     if (text.length <= 120) return text;
     return '${text.substring(0, 120)}...';
   }
 
   String get displayDetailBody {
-    final text = translatedBody.isNotEmpty ? translatedBody : body;
+    final parts = <String>[
+      if (eventSummary.trim().isNotEmpty) '事件判断：${eventSummary.trim()}',
+      if (impactSummary.trim().isNotEmpty) '影响分析：${impactSummary.trim()}',
+      if (translatedBody.trim().isNotEmpty)
+        translatedBody.trim()
+      else if (body.trim().isNotEmpty)
+        body.trim(),
+    ];
+    final text = parts.join('\n\n').trim();
     if (text.trim().isEmpty) return displayTitle;
     return text.trim();
   }

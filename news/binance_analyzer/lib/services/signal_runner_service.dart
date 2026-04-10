@@ -8,6 +8,7 @@ import '../models/coin_data.dart';
 import '../models/strategy_snapshot.dart';
 import 'binance_service.dart';
 import 'hourly_replay_service.dart';
+import 'leader_prediction_service.dart';
 import 'market_bottom_detector_service.dart';
 import 'recommendation_engine.dart';
 import 'startup_scanner_service.dart';
@@ -237,6 +238,26 @@ class StartupScanRunResult {
   });
 }
 
+class LeaderPredictionRunResult {
+  final DateTime generatedAt;
+  final LeaderPredictionResult result;
+  final Map<String, dynamic> payload;
+  final String reportPath;
+  final String logPath;
+  final String statsPath;
+  final PushDeliveryResult pushResult;
+
+  const LeaderPredictionRunResult({
+    required this.generatedAt,
+    required this.result,
+    required this.payload,
+    required this.reportPath,
+    required this.logPath,
+    required this.statsPath,
+    required this.pushResult,
+  });
+}
+
 class SignalRunnerService {
   static const defaultDailyReportPath =
       'build/reports/daily_signal_report.json';
@@ -250,6 +271,13 @@ class SignalRunnerService {
       'build/reports/client_signal_actions.json';
   static const defaultClientExecutionCyclePath =
       'build/reports/client_execution_cycles.json';
+  static const defaultLeaderPredictionReportPath =
+      'build/reports/leader_prediction_report.json';
+  static const defaultLeaderPredictionLogPath =
+      'build/reports/leader_prediction_log.json';
+  static const defaultLeaderPredictionStatsPath =
+      'build/reports/leader_prediction_stats.json';
+  static const defaultLeaderPredictionBacktestDays = 60;
   static const defaultStartupPredictionEvaluationHours = 24;
   static const Set<String> _trackedPredictionSignalTypes = {
     'startup_buy',
@@ -258,6 +286,7 @@ class SignalRunnerService {
 
   final BinanceService _binance;
   final HourlyReplayService _replay;
+  final LeaderPredictionService _leaderPrediction;
   final StartupScannerService _startupScanner;
   final MarketBottomDetectorService _marketBottomDetector;
   final StartupStrategyBacktestService _startupStrategyBacktest;
@@ -266,12 +295,14 @@ class SignalRunnerService {
   SignalRunnerService({
     BinanceService? binance,
     HourlyReplayService? replay,
+    LeaderPredictionService? leaderPrediction,
     StartupScannerService? startupScanner,
     MarketBottomDetectorService? marketBottomDetector,
     StartupStrategyBacktestService? startupStrategyBacktest,
     http.Client? httpClient,
   })  : _binance = binance ?? BinanceService(),
         _replay = replay ?? HourlyReplayService(),
+        _leaderPrediction = leaderPrediction ?? LeaderPredictionService(),
         _startupScanner = startupScanner ?? StartupScannerService(),
         _marketBottomDetector =
             marketBottomDetector ?? MarketBottomDetectorService(),
@@ -841,6 +872,220 @@ class SignalRunnerService {
     );
   }
 
+  Future<LeaderPredictionRunResult> runLeaderPrediction({
+    List<String>? requestedSymbols,
+    String reportPath = defaultLeaderPredictionReportPath,
+    String logPath = defaultLeaderPredictionLogPath,
+    String statsPath = defaultLeaderPredictionStatsPath,
+    int lookbackDays = defaultLeaderPredictionBacktestDays,
+    PushProvider? pushProvider,
+    String? feishuWebhookUrl,
+    String? ntfyTopic,
+    String? ntfyServer,
+    bool publishPush = true,
+    bool dedupePush = false,
+    String pushStatePath = defaultPushStatePath,
+    Duration pushDedupeWindow = const Duration(hours: 6),
+  }) async {
+    final generatedAt = DateTime.now();
+    final coins = await _binance.fetchTickers(symbols: requestedSymbols);
+    final symbols = coins.map((coin) => coin.symbol).toList()..sort();
+    if (symbols.isEmpty) {
+      throw StateError('当前没有可用于领涨预测的币种');
+    }
+
+    final historyBars = max(lookbackDays + 45, 120);
+    final histories = await Future.wait([
+      _binance.fetchWatchlistKlines(
+        symbols: symbols,
+        interval: '1d',
+        limit: historyBars,
+        forceRefresh: true,
+        chunkSize: 18,
+      ),
+      _binance.fetchWatchlistKlines(
+        symbols: const ['BTCUSDT'],
+        interval: '1d',
+        limit: historyBars,
+        forceRefresh: true,
+      ),
+    ]);
+
+    final dailyHistory = histories[0];
+    final btcDailyHistory = histories[1]['BTCUSDT'] ?? const <Kline>[];
+    final result = _leaderPrediction.analyze(
+      currentCoins: coins,
+      dailyHistory: dailyHistory,
+      btcDailyHistory: btcDailyHistory,
+    );
+    final payload = _buildLeaderPredictionReportPayload(
+      generatedAt: generatedAt,
+      result: result,
+      lookbackDays: lookbackDays,
+      activeSymbols: symbols,
+    );
+    await _writeJsonFile(reportPath, payload);
+
+    await _upsertLeaderPredictionRecord(
+      path: logPath,
+      generatedAt: generatedAt,
+      result: result,
+    );
+    await refreshLeaderPredictionLog(
+      path: logPath,
+      statsPath: statsPath,
+      dailyHistory: dailyHistory,
+      btcDailyHistory: btcDailyHistory,
+      lookbackDays: lookbackDays,
+    );
+
+    final pushResult = publishPush
+        ? await publishLeaderPrediction(
+            result: result,
+            provider: pushProvider ??
+                parsePushProvider(Platform.environment['PUSH_PROVIDER']),
+            feishuWebhookUrl:
+                feishuWebhookUrl ?? Platform.environment['FEISHU_WEBHOOK_URL'],
+            server: ntfyServer ?? Platform.environment['NTFY_SERVER'],
+            topic: ntfyTopic ?? Platform.environment['NTFY_TOPIC'],
+            dedupe: dedupePush,
+            statePath: pushStatePath,
+            dedupeWindow: pushDedupeWindow,
+            dedupeKey:
+                'leader_prediction|${_leaderPredictionTargetDate(generatedAt).toIso8601String()}',
+          )
+        : PushDeliveryResult(
+            attempted: false,
+            sent: false,
+            provider: 'disabled',
+            status: 'disabled',
+            message: '云端运行已关闭远程推送',
+            recordedAt: DateTime.now(),
+          );
+
+    return LeaderPredictionRunResult(
+      generatedAt: generatedAt,
+      result: result,
+      payload: payload,
+      reportPath: reportPath,
+      logPath: logPath,
+      statsPath: statsPath,
+      pushResult: pushResult,
+    );
+  }
+
+  Future<Map<String, dynamic>> refreshLeaderPredictionStats({
+    List<String>? requestedSymbols,
+    String logPath = defaultLeaderPredictionLogPath,
+    String statsPath = defaultLeaderPredictionStatsPath,
+    int lookbackDays = defaultLeaderPredictionBacktestDays,
+  }) async {
+    final coins = await _binance.fetchTickers(symbols: requestedSymbols);
+    final symbols = coins.map((coin) => coin.symbol).toList()..sort();
+    if (symbols.isEmpty) {
+      final emptyPayload = {
+        'updatedAt': DateTime.now().toIso8601String(),
+        'lookbackDays': lookbackDays,
+        'summary': {
+          'windowDays': lookbackDays,
+          'totalDays': 0,
+          'recommendDays': 0,
+          'suppressedDays': 0,
+          'suppressRate': 0.0,
+          'top1HitRate': 0.0,
+          'top3HitRate': 0.0,
+          'avgPredictedReturn': 0.0,
+          'avgLeaderReturn': 0.0,
+          'avgExcessVsMedian': 0.0,
+          'recent20Top1HitRate': 0.0,
+          'recent20Top3HitRate': 0.0,
+          'longestMissStreak': 0,
+          'latestTop1': null,
+          'latestTop3': const <String>[],
+          'currentRegimeStatus': 'stand_aside',
+        },
+        'benchmarks': const <Map<String, dynamic>>[],
+        'liveSummary': {
+          'totalRecords': 0,
+          'pending': 0,
+          'settled': 0,
+          'suppressed': 0,
+        },
+        'records': const <Map<String, dynamic>>[],
+      };
+      await _writeJsonFile(statsPath, emptyPayload);
+      return emptyPayload;
+    }
+
+    final historyBars = max(lookbackDays + 45, 120);
+    final histories = await Future.wait([
+      _binance.fetchWatchlistKlines(
+        symbols: symbols,
+        interval: '1d',
+        limit: historyBars,
+        forceRefresh: true,
+        chunkSize: 18,
+      ),
+      _binance.fetchWatchlistKlines(
+        symbols: const ['BTCUSDT'],
+        interval: '1d',
+        limit: historyBars,
+        forceRefresh: true,
+      ),
+    ]);
+    return refreshLeaderPredictionLog(
+      path: logPath,
+      statsPath: statsPath,
+      dailyHistory: histories[0],
+      btcDailyHistory: histories[1]['BTCUSDT'] ?? const <Kline>[],
+      lookbackDays: lookbackDays,
+    );
+  }
+
+  Future<Map<String, dynamic>> refreshLeaderPredictionLog({
+    String path = defaultLeaderPredictionLogPath,
+    String statsPath = defaultLeaderPredictionStatsPath,
+    required Map<String, List<Kline>> dailyHistory,
+    required List<Kline> btcDailyHistory,
+    int lookbackDays = defaultLeaderPredictionBacktestDays,
+  }) async {
+    final existing = await _readJsonFile(path);
+    final records = (existing['records'] as List<dynamic>? ?? const [])
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+
+    _settleLeaderPredictionRecords(
+      records: records,
+      dailyHistory: dailyHistory,
+    );
+
+    final liveSummary = _buildLeaderPredictionLiveSummary(records);
+    final backtest = _buildLeaderPredictionBacktest(
+      dailyHistory: dailyHistory,
+      btcDailyHistory: btcDailyHistory,
+      lookbackDays: lookbackDays,
+    );
+    final payload = {
+      'updatedAt': DateTime.now().toIso8601String(),
+      'lookbackDays': lookbackDays,
+      'summary': backtest['summary'],
+      'benchmarks': backtest['benchmarks'],
+      'liveSummary': liveSummary,
+      'records': records.take(240).toList(),
+      'backtestRecords': (backtest['records'] as List<dynamic>? ?? const [])
+          .take(120)
+          .toList(),
+    };
+
+    await _writeJsonFile(path, {
+      'updatedAt': payload['updatedAt'],
+      'liveSummary': liveSummary,
+      'records': records.take(240).toList(),
+    });
+    await _writeJsonFile(statsPath, payload);
+    return payload;
+  }
+
   Future<Map<String, dynamic>> refreshStartupPredictionLog({
     String path = defaultStartupBuyLogPath,
     List<CoinData> currentCoins = const [],
@@ -1002,6 +1247,45 @@ class SignalRunnerService {
           recordedAt: DateTime.now(),
         );
     }
+  }
+
+  Future<PushDeliveryResult> publishLeaderPrediction({
+    required LeaderPredictionResult result,
+    PushProvider provider = PushProvider.auto,
+    String? feishuWebhookUrl,
+    String? server,
+    String? topic,
+    bool dedupe = false,
+    String statePath = defaultPushStatePath,
+    Duration dedupeWindow = const Duration(hours: 6),
+    String dedupeKey = 'leader_prediction',
+  }) async {
+    final regimeLabel = _leaderPredictionRegimeLabel(result.regimeStatus);
+    if (result.top3.isEmpty || result.regimeStatus != 'recommend') {
+      return PushDeliveryResult(
+        attempted: false,
+        sent: false,
+        provider: provider.name,
+        status: 'skipped_no_actionable',
+        message: '当前状态为$regimeLabel，仅记录领涨预测，不发送飞书',
+        recordedAt: DateTime.now(),
+      );
+    }
+
+    final body = _buildLeaderPredictionPushBody(result: result);
+    return publishTextMessage(
+      provider: provider,
+      feishuWebhookUrl: feishuWebhookUrl,
+      server: server,
+      topic: topic,
+      body: body,
+      title: 'Binance Leader Prediction',
+      dedupe: dedupe,
+      statePath: statePath,
+      dedupeWindow: dedupeWindow,
+      dedupeKey: dedupeKey,
+      successMessage: '已推送下一根日线领涨预测',
+    );
   }
 
   Future<PushDeliveryResult> publishStartupScan({
@@ -2356,6 +2640,746 @@ class SignalRunnerService {
       'bySignalType': bySignalTypeSummary,
       'byStartupPolicy': byStartupPolicySummary,
     };
+  }
+
+  Map<String, dynamic> _buildLeaderPredictionReportPayload({
+    required DateTime generatedAt,
+    required LeaderPredictionResult result,
+    required int lookbackDays,
+    required List<String> activeSymbols,
+  }) {
+    final top1 = result.top3.isEmpty ? null : result.top3.first;
+    return {
+      'generatedAt': generatedAt.toIso8601String(),
+      'mode': 'leader_prediction',
+      'predictionWindow': 'next_binance_daily_candle',
+      'lookbackDays': lookbackDays,
+      'activeSymbols': activeSymbols,
+      'regimeStatus': result.regimeStatus,
+      'regimeLabel': _leaderPredictionRegimeLabel(result.regimeStatus),
+      'regimeReason': result.regimeReason,
+      'marketBreadth': result.marketBreadth,
+      'medianSevenDayReturn': result.medianSevenDayReturn,
+      'btcDistanceToSma20': result.btcDistanceToSma20,
+      'summary': result.summary,
+      'top1': top1 == null
+          ? null
+          : {
+              'symbol': top1.displayName,
+              'score': top1.score,
+              'recommendation': top1.recommendation,
+              'price': top1.lastPrice,
+              'dayChangePercent': top1.priceChangePercent,
+              'thirtyDayChange': top1.thirtyDayChange,
+              'sevenDayChange': top1.sevenDayChange,
+              'timingLabel': top1.timingLabel,
+              'timingReason': top1.timingReason,
+              'reason': top1.reason,
+              'componentScores': _top1ComponentScoresFromResult(result.summary),
+            },
+      'top3': result.top3
+          .map((coin) => {
+                'symbol': coin.displayName,
+                'score': coin.score,
+                'recommendation': coin.recommendation,
+                'price': coin.lastPrice,
+                'dayChangePercent': coin.priceChangePercent,
+                'thirtyDayChange': coin.thirtyDayChange,
+                'sevenDayChange': coin.sevenDayChange,
+                'timingLabel': coin.timingLabel,
+                'timingReason': coin.timingReason,
+                'reason': coin.reason,
+              })
+          .toList(),
+    };
+  }
+
+  String _buildLeaderPredictionPushBody({
+    required LeaderPredictionResult result,
+  }) {
+    final buffer = StringBuffer()
+      ..writeln('Binance 下一根日线领涨预测')
+      ..writeln('状态: ${_leaderPredictionRegimeLabel(result.regimeStatus)}')
+      ..writeln('结算窗口: 下一根币安日线（UTC 00:00）')
+      ..writeln('市场判断: ${result.regimeReason}');
+
+    final top1 = result.top3.isEmpty ? null : result.top3.first;
+    if (top1 != null) {
+      buffer
+        ..writeln('')
+        ..writeln(
+          'Top1: ${top1.displayName} | ${(top1.score * 100).round()}分 | ${top1.recommendation}',
+        )
+        ..writeln(
+          'Top3: ${result.top3.map((item) => item.displayName).join(', ')}',
+        )
+        ..writeln('核心原因:');
+      for (final line in _leaderPredictionReasonLines(top1, result.summary)) {
+        buffer.writeln(line);
+      }
+    }
+
+    return buffer.toString().trim();
+  }
+
+  List<String> _leaderPredictionReasonLines(
+    CoinData top1,
+    Map<String, dynamic> summary,
+  ) {
+    final components = _top1ComponentScoresFromResult(summary);
+    final momentum = ((_asDouble(components['momentum'])) * 100).round();
+    final trend = ((_asDouble(components['trend'])) * 100).round();
+    final lowVol = ((_asDouble(components['lowVol'])) * 100).round();
+    final volumeHealth =
+        ((_asDouble(components['volumeHealth'])) * 100).round();
+    final ret14 = _asDouble(components['ret14']);
+    final ret7 = _asDouble(components['ret7']);
+    final volumeRatio = _asDouble(components['volumeRatio']);
+    final distanceToHigh10 = _asDouble(components['distanceToHigh10']);
+    return [
+      '1. ${top1.displayName} 的 14d/7d 相对动量靠前，动量分 $momentum，14d ${ret14 >= 0 ? '+' : ''}${ret14.toStringAsFixed(1)}%，7d ${ret7 >= 0 ? '+' : ''}${ret7.toStringAsFixed(1)}%。',
+      '2. 趋势确认分 $trend，当前结构配合 ${top1.timingLabel}，${top1.timingReason}',
+      '3. 风险过滤后仍保留优势，低波动 $lowVol，量能健康 $volumeHealth，3d/10d 量比 ${volumeRatio.toStringAsFixed(2)}x，距 10d 高点 ${distanceToHigh10.toStringAsFixed(2)}%。',
+    ];
+  }
+
+  String _leaderPredictionRegimeLabel(String status) {
+    switch (status) {
+      case 'recommend':
+        return '可推荐';
+      case 'watch_only':
+        return '仅观察';
+      default:
+        return '不出手';
+    }
+  }
+
+  Map<String, dynamic> _top1ComponentScoresFromResult(
+    Map<String, dynamic> summary,
+  ) {
+    final raw = summary['top1ComponentScores'];
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) {
+      return Map<String, dynamic>.from(raw);
+    }
+    return <String, dynamic>{};
+  }
+
+  Future<void> _upsertLeaderPredictionRecord({
+    required String path,
+    required DateTime generatedAt,
+    required LeaderPredictionResult result,
+  }) async {
+    final existing = await _readJsonFile(path);
+    final records = (existing['records'] as List<dynamic>? ?? const [])
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+    final targetDate = _leaderPredictionTargetDate(generatedAt);
+    final id = _leaderPredictionRecordId(targetDate);
+    records.removeWhere((record) =>
+        record['id']?.toString() == id &&
+        record['status']?.toString() != 'settled');
+
+    final top1 = result.top3.isEmpty ? null : result.top3.first;
+    final status =
+        result.regimeStatus == 'recommend' ? 'pending' : 'suppressed';
+    records.insert(0, {
+      'id': id,
+      'recordedAt': generatedAt.toIso8601String(),
+      'predictionWindow': 'next_binance_daily_candle',
+      'signalType': 'leader_prediction',
+      'targetCandleAt': targetDate.toIso8601String(),
+      'top1Symbol': top1?.displayName,
+      'top3Symbols': result.top3.map((item) => item.displayName).toList(),
+      'totalScore': top1?.score ?? 0.0,
+      'componentScores': _top1ComponentScoresFromResult(result.summary),
+      'regimeStatus': result.regimeStatus,
+      'regimeLabel': _leaderPredictionRegimeLabel(result.regimeStatus),
+      'regimeReason': result.regimeReason,
+      'status': status,
+      'settledAt': null,
+      'actualLeader': null,
+      'actualTop3': const <String>[],
+      'top1Hit': null,
+      'top3Hit': null,
+      'predictedCoinReturn': null,
+      'leaderReturn': null,
+      'excessVsMedian': null,
+      'marketBreadth': result.marketBreadth,
+      'medianSevenDayReturn': result.medianSevenDayReturn,
+      'btcDistanceToSma20': result.btcDistanceToSma20,
+    });
+
+    await _writeJsonFile(path, {
+      'updatedAt': DateTime.now().toIso8601String(),
+      'records': records.take(240).toList(),
+    });
+  }
+
+  void _settleLeaderPredictionRecords({
+    required List<Map<String, dynamic>> records,
+    required Map<String, List<Kline>> dailyHistory,
+  }) {
+    if (records.isEmpty || dailyHistory.isEmpty) return;
+
+    final symbolBars = <String, List<Kline>>{};
+    for (final entry in dailyHistory.entries) {
+      final normalized = BinanceService.toSymbol(entry.key);
+      symbolBars[normalized] = _completeDailyBars(entry.value);
+    }
+
+    final actualReturnByDate = <int, Map<String, double>>{};
+    for (final entry in symbolBars.entries) {
+      final bars = entry.value;
+      for (var i = 1; i < bars.length; i += 1) {
+        final previous = bars[i - 1];
+        final current = bars[i];
+        if (previous.close <= 0) continue;
+        actualReturnByDate.putIfAbsent(
+                current.openTime, () => <String, double>{})[entry.key] =
+            ((current.close - previous.close) / previous.close) * 100;
+      }
+    }
+
+    for (final record in records) {
+      final status = record['status']?.toString() ?? '';
+      if (status == 'settled') continue;
+
+      final targetDate =
+          DateTime.tryParse(record['targetCandleAt']?.toString() ?? '');
+      if (targetDate == null) continue;
+      final returns = actualReturnByDate[targetDate.millisecondsSinceEpoch];
+      if (returns == null || returns.isEmpty) continue;
+
+      final sorted = returns.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      final actualLeader = sorted.first.key.replaceAll('USDT', '');
+      final actualTop3 = sorted
+          .take(3)
+          .map((item) => item.key.replaceAll('USDT', ''))
+          .toList();
+      final predictedTop1 = record['top1Symbol']?.toString();
+      final predictedTop3 =
+          (record['top3Symbols'] as List<dynamic>? ?? const [])
+              .map((item) => item.toString())
+              .toList();
+      final predictedReturn = predictedTop1 == null
+          ? null
+          : returns[BinanceService.toSymbol(predictedTop1)];
+      final medianReturn = _safeMedian(returns.values.toList());
+
+      record['actualLeader'] = actualLeader;
+      record['actualTop3'] = actualTop3;
+      record['leaderReturn'] = sorted.first.value;
+      record['predictedCoinReturn'] = predictedReturn;
+      record['excessVsMedian'] =
+          predictedReturn == null ? null : predictedReturn - medianReturn;
+      record['settledAt'] = DateTime.now().toIso8601String();
+
+      if (status == 'suppressed') {
+        continue;
+      }
+
+      record['status'] = 'settled';
+      record['top1Hit'] = predictedTop1 == actualLeader;
+      record['top3Hit'] = predictedTop3.contains(actualLeader);
+    }
+  }
+
+  Map<String, dynamic> _buildLeaderPredictionLiveSummary(
+    List<Map<String, dynamic>> records,
+  ) {
+    var settled = 0;
+    var pending = 0;
+    var suppressed = 0;
+    var wins = 0;
+    var top3Wins = 0;
+    var totalPredictedReturn = 0.0;
+    var totalExcess = 0.0;
+    DateTime? latestRecordedAt;
+
+    for (final record in records) {
+      final status = record['status']?.toString() ?? '';
+      final recordedAt =
+          DateTime.tryParse(record['recordedAt']?.toString() ?? '');
+      if (recordedAt != null &&
+          (latestRecordedAt == null || recordedAt.isAfter(latestRecordedAt))) {
+        latestRecordedAt = recordedAt;
+      }
+
+      if (status == 'pending') pending += 1;
+      if (status == 'suppressed') suppressed += 1;
+      if (status != 'settled') continue;
+      settled += 1;
+      if (record['top1Hit'] == true) wins += 1;
+      if (record['top3Hit'] == true) top3Wins += 1;
+      totalPredictedReturn += _asDouble(record['predictedCoinReturn']);
+      totalExcess += _asDouble(record['excessVsMedian']);
+    }
+
+    return {
+      'totalRecords': records.length,
+      'pending': pending,
+      'suppressed': suppressed,
+      'settled': settled,
+      'top1Wins': wins,
+      'top3Wins': top3Wins,
+      'top1HitRate': settled == 0 ? 0.0 : wins / settled,
+      'top3HitRate': settled == 0 ? 0.0 : top3Wins / settled,
+      'avgPredictedReturn': settled == 0 ? 0.0 : totalPredictedReturn / settled,
+      'avgExcessVsMedian': settled == 0 ? 0.0 : totalExcess / settled,
+      'latestRecordedAt': latestRecordedAt?.toIso8601String(),
+    };
+  }
+
+  Map<String, dynamic> _buildLeaderPredictionBacktest({
+    required Map<String, List<Kline>> dailyHistory,
+    required List<Kline> btcDailyHistory,
+    required int lookbackDays,
+  }) {
+    final btcBars = _completeDailyBars(btcDailyHistory);
+    if (btcBars.length < 35) {
+      return {
+        'summary': {
+          'windowDays': lookbackDays,
+          'totalDays': 0,
+          'recommendDays': 0,
+          'suppressedDays': 0,
+          'suppressRate': 0.0,
+          'top1HitRate': 0.0,
+          'top3HitRate': 0.0,
+          'avgPredictedReturn': 0.0,
+          'avgLeaderReturn': 0.0,
+          'avgExcessVsMedian': 0.0,
+          'recent20Top1HitRate': 0.0,
+          'recent20Top3HitRate': 0.0,
+          'longestMissStreak': 0,
+          'latestTop1': null,
+          'latestTop3': const <String>[],
+          'currentRegimeStatus': 'stand_aside',
+        },
+        'benchmarks': const <Map<String, dynamic>>[],
+        'records': const <Map<String, dynamic>>[],
+      };
+    }
+
+    final symbolBars = <String, List<Kline>>{};
+    for (final entry in dailyHistory.entries) {
+      final normalized = BinanceService.toSymbol(entry.key);
+      final bars = _completeDailyBars(entry.value);
+      if (bars.length >= 31) {
+        symbolBars[normalized] = bars;
+      }
+    }
+
+    final btcDateSet = btcBars.map((item) => item.openTime).toSet();
+    final candidateDates = btcBars
+        .skip(30)
+        .take(max(0, btcBars.length - 31))
+        .map((item) => item.openTime)
+        .where(btcDateSet.contains)
+        .toList();
+    final selectedDates = candidateDates.length <= lookbackDays
+        ? candidateDates
+        : candidateDates.sublist(candidateDates.length - lookbackDays);
+
+    final modelRecords = <Map<String, dynamic>>[];
+    final baselineBuckets = <String, List<Map<String, dynamic>>>{
+      'yesterday_leader_continue': [],
+      'momentum_7d': [],
+      'momentum_14d': [],
+      'random': [],
+    };
+    String? previousActualLeader;
+
+    for (final currentDate in selectedDates) {
+      final currentCoins = <CoinData>[];
+      final slicedHistory = <String, List<Kline>>{};
+      final actualReturns = <String, double>{};
+      final nextDate = currentDate + const Duration(days: 1).inMilliseconds;
+
+      for (final entry in symbolBars.entries) {
+        final bars = entry.value;
+        final upto = _barsUpToDate(bars, currentDate);
+        if (upto.length < 30) continue;
+
+        final currentBar = bars.firstWhere(
+          (item) => item.openTime == currentDate,
+          orElse: () => const Kline(
+            openTime: 0,
+            open: 0,
+            high: 0,
+            low: 0,
+            close: 0,
+            volume: 0,
+            closeTime: 0,
+          ),
+        );
+        final nextBar = bars.firstWhere(
+          (item) => item.openTime == nextDate,
+          orElse: () => const Kline(
+            openTime: 0,
+            open: 0,
+            high: 0,
+            low: 0,
+            close: 0,
+            volume: 0,
+            closeTime: 0,
+          ),
+        );
+        if (currentBar.openTime == 0 || nextBar.openTime == 0) continue;
+
+        slicedHistory[entry.key] = upto;
+        currentCoins.add(_coinFromBar(entry.key, currentBar));
+        if (currentBar.close > 0) {
+          actualReturns[entry.key] =
+              ((nextBar.close - currentBar.close) / currentBar.close) * 100;
+        }
+      }
+
+      final btcSlice = _barsUpToDate(btcBars, currentDate);
+      if (currentCoins.length < 3 ||
+          btcSlice.length < 30 ||
+          actualReturns.isEmpty) {
+        continue;
+      }
+
+      final result = _leaderPrediction.analyze(
+        currentCoins: currentCoins,
+        dailyHistory: slicedHistory,
+        btcDailyHistory: btcSlice,
+      );
+      final sortedActual = actualReturns.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      final actualLeader = sortedActual.first.key.replaceAll('USDT', '');
+      final actualTop3 = sortedActual
+          .take(3)
+          .map((item) => item.key.replaceAll('USDT', ''))
+          .toList();
+      final medianReturn = _safeMedian(actualReturns.values.toList());
+      final top1 = result.top3.isEmpty ? null : result.top3.first.displayName;
+      final top3 = result.top3.map((item) => item.displayName).toList();
+      final suppressed = result.regimeStatus != 'recommend';
+      final predictedReturn =
+          top1 == null ? null : actualReturns[BinanceService.toSymbol(top1)];
+
+      modelRecords.add({
+        'id': _leaderPredictionRecordId(
+          DateTime.fromMillisecondsSinceEpoch(nextDate, isUtc: true),
+        ),
+        'recordedAt':
+            DateTime.fromMillisecondsSinceEpoch(currentDate, isUtc: true)
+                .toIso8601String(),
+        'predictionWindow': 'next_binance_daily_candle',
+        'targetCandleAt':
+            DateTime.fromMillisecondsSinceEpoch(nextDate, isUtc: true)
+                .toIso8601String(),
+        'top1Symbol': top1,
+        'top3Symbols': top3,
+        'totalScore': result.top3.isEmpty ? 0.0 : result.top3.first.score,
+        'componentScores': _top1ComponentScoresFromResult(result.summary),
+        'regimeStatus': result.regimeStatus,
+        'status': suppressed ? 'suppressed' : 'settled',
+        'settledAt': DateTime.fromMillisecondsSinceEpoch(nextDate, isUtc: true)
+            .toIso8601String(),
+        'actualLeader': actualLeader,
+        'actualTop3': actualTop3,
+        'top1Hit': !suppressed && top1 == actualLeader,
+        'top3Hit': !suppressed && top3.contains(actualLeader),
+        'predictedCoinReturn': predictedReturn,
+        'leaderReturn': sortedActual.first.value,
+        'excessVsMedian':
+            predictedReturn == null ? null : predictedReturn - medianReturn,
+      });
+
+      final sortedSymbols = actualReturns.keys.toList()..sort();
+      final randomSymbol = sortedSymbols.isEmpty
+          ? null
+          : sortedSymbols[currentDate % sortedSymbols.length]
+              .replaceAll('USDT', '');
+      baselineBuckets['yesterday_leader_continue']!.add(
+        _leaderBenchmarkRecord(
+          name: 'yesterday_leader_continue',
+          targetDate: nextDate,
+          predictedSymbol: previousActualLeader,
+          actualLeader: actualLeader,
+          actualTop3: actualTop3,
+          actualReturns: actualReturns,
+          medianReturn: medianReturn,
+        ),
+      );
+      baselineBuckets['momentum_7d']!.add(
+        _leaderBenchmarkRecord(
+          name: 'momentum_7d',
+          targetDate: nextDate,
+          predictedSymbol: _pickMomentumLeader(slicedHistory, 7),
+          actualLeader: actualLeader,
+          actualTop3: actualTop3,
+          actualReturns: actualReturns,
+          medianReturn: medianReturn,
+        ),
+      );
+      baselineBuckets['momentum_14d']!.add(
+        _leaderBenchmarkRecord(
+          name: 'momentum_14d',
+          targetDate: nextDate,
+          predictedSymbol: _pickMomentumLeader(slicedHistory, 14),
+          actualLeader: actualLeader,
+          actualTop3: actualTop3,
+          actualReturns: actualReturns,
+          medianReturn: medianReturn,
+        ),
+      );
+      baselineBuckets['random']!.add(
+        _leaderBenchmarkRecord(
+          name: 'random',
+          targetDate: nextDate,
+          predictedSymbol: randomSymbol,
+          actualLeader: actualLeader,
+          actualTop3: actualTop3,
+          actualReturns: actualReturns,
+          medianReturn: medianReturn,
+        ),
+      );
+
+      previousActualLeader = actualLeader;
+    }
+
+    modelRecords.sort((a, b) => (a['targetCandleAt'] as String)
+        .compareTo(b['targetCandleAt'] as String));
+    final summary = _summarizeLeaderPredictionRecords(modelRecords);
+    final benchmarks = baselineBuckets.entries
+        .map((entry) => _summarizeLeaderBenchmark(entry.key, entry.value))
+        .toList();
+
+    return {
+      'summary': summary,
+      'benchmarks': benchmarks,
+      'records': modelRecords,
+    };
+  }
+
+  Map<String, dynamic> _leaderBenchmarkRecord({
+    required String name,
+    required int targetDate,
+    required String? predictedSymbol,
+    required String actualLeader,
+    required List<String> actualTop3,
+    required Map<String, double> actualReturns,
+    required double medianReturn,
+  }) {
+    final predictedReturn = predictedSymbol == null
+        ? null
+        : actualReturns[BinanceService.toSymbol(predictedSymbol)];
+    return {
+      'name': name,
+      'targetCandleAt':
+          DateTime.fromMillisecondsSinceEpoch(targetDate, isUtc: true)
+              .toIso8601String(),
+      'predictedSymbol': predictedSymbol,
+      'actualLeader': actualLeader,
+      'top1Hit': predictedSymbol != null && predictedSymbol == actualLeader,
+      'top3Hit':
+          predictedSymbol != null && actualTop3.contains(predictedSymbol),
+      'predictedReturn': predictedReturn,
+      'leaderReturn':
+          actualReturns[BinanceService.toSymbol(actualLeader)] ?? 0.0,
+      'excessVsMedian':
+          predictedReturn == null ? null : predictedReturn - medianReturn,
+    };
+  }
+
+  Map<String, dynamic> _summarizeLeaderPredictionRecords(
+    List<Map<String, dynamic>> records,
+  ) {
+    final settled = records
+        .where((record) => record['status']?.toString() == 'settled')
+        .toList();
+    final suppressed = records.length - settled.length;
+    final recent20 =
+        settled.length <= 20 ? settled : settled.sublist(settled.length - 20);
+
+    var top1Hits = 0;
+    var top3Hits = 0;
+    var totalPredictedReturn = 0.0;
+    var totalLeaderReturn = 0.0;
+    var totalExcess = 0.0;
+    var missStreak = 0;
+    var longestMissStreak = 0;
+
+    for (final record in settled) {
+      if (record['top1Hit'] == true) {
+        top1Hits += 1;
+        missStreak = 0;
+      } else {
+        missStreak += 1;
+        if (missStreak > longestMissStreak) {
+          longestMissStreak = missStreak;
+        }
+      }
+      if (record['top3Hit'] == true) {
+        top3Hits += 1;
+      }
+      totalPredictedReturn += _asDouble(record['predictedCoinReturn']);
+      totalLeaderReturn += _asDouble(record['leaderReturn']);
+      totalExcess += _asDouble(record['excessVsMedian']);
+    }
+
+    var recent20Top1Hits = 0;
+    var recent20Top3Hits = 0;
+    for (final record in recent20) {
+      if (record['top1Hit'] == true) recent20Top1Hits += 1;
+      if (record['top3Hit'] == true) recent20Top3Hits += 1;
+    }
+
+    final latest = records.isEmpty ? null : records.last;
+    return {
+      'windowDays': records.length,
+      'totalDays': records.length,
+      'recommendDays': settled.length,
+      'suppressedDays': suppressed,
+      'suppressRate': records.isEmpty ? 0.0 : suppressed / records.length,
+      'top1HitRate': settled.isEmpty ? 0.0 : top1Hits / settled.length,
+      'top3HitRate': settled.isEmpty ? 0.0 : top3Hits / settled.length,
+      'avgPredictedReturn':
+          settled.isEmpty ? 0.0 : totalPredictedReturn / settled.length,
+      'avgLeaderReturn':
+          settled.isEmpty ? 0.0 : totalLeaderReturn / settled.length,
+      'avgExcessVsMedian': settled.isEmpty ? 0.0 : totalExcess / settled.length,
+      'recent20Top1HitRate':
+          recent20.isEmpty ? 0.0 : recent20Top1Hits / recent20.length,
+      'recent20Top3HitRate':
+          recent20.isEmpty ? 0.0 : recent20Top3Hits / recent20.length,
+      'longestMissStreak': longestMissStreak,
+      'latestTop1': latest?['top1Symbol'],
+      'latestTop3': latest?['top3Symbols'] ?? const <String>[],
+      'currentRegimeStatus': latest?['regimeStatus'] ?? 'stand_aside',
+    };
+  }
+
+  Map<String, dynamic> _summarizeLeaderBenchmark(
+    String name,
+    List<Map<String, dynamic>> records,
+  ) {
+    if (records.isEmpty) {
+      return {
+        'name': name,
+        'totalDays': 0,
+        'top1HitRate': 0.0,
+        'top3HitRate': 0.0,
+        'avgPredictedReturn': 0.0,
+        'avgExcessVsMedian': 0.0,
+      };
+    }
+
+    var top1Hits = 0;
+    var top3Hits = 0;
+    var totalPredictedReturn = 0.0;
+    var totalExcess = 0.0;
+    var validPredictions = 0;
+
+    for (final record in records) {
+      if (record['top1Hit'] == true) top1Hits += 1;
+      if (record['top3Hit'] == true) top3Hits += 1;
+      final predictedReturn = record['predictedReturn'];
+      if (predictedReturn != null) {
+        validPredictions += 1;
+        totalPredictedReturn += _asDouble(predictedReturn);
+        totalExcess += _asDouble(record['excessVsMedian']);
+      }
+    }
+
+    return {
+      'name': name,
+      'totalDays': records.length,
+      'top1HitRate': top1Hits / records.length,
+      'top3HitRate': top3Hits / records.length,
+      'avgPredictedReturn':
+          validPredictions == 0 ? 0.0 : totalPredictedReturn / validPredictions,
+      'avgExcessVsMedian':
+          validPredictions == 0 ? 0.0 : totalExcess / validPredictions,
+    };
+  }
+
+  String? _pickMomentumLeader(
+    Map<String, List<Kline>> slicedHistory,
+    int days,
+  ) {
+    String? bestSymbol;
+    double? bestReturn;
+    for (final entry in slicedHistory.entries) {
+      final value = _periodReturnFromBars(entry.value, days);
+      if (bestReturn == null || value > bestReturn) {
+        bestReturn = value;
+        bestSymbol = entry.key.replaceAll('USDT', '');
+      }
+    }
+    return bestSymbol;
+  }
+
+  List<Kline> _completeDailyBars(List<Kline> bars) {
+    if (bars.isEmpty) return const <Kline>[];
+    final ordered = [...bars]..sort((a, b) => a.openTime.compareTo(b.openTime));
+    final last = ordered.last;
+    if (_isCurrentUtcDailyBar(last.openTime)) {
+      return ordered.sublist(0, max(0, ordered.length - 1));
+    }
+    return ordered;
+  }
+
+  bool _isCurrentUtcDailyBar(int openTime) {
+    final nowUtc = DateTime.now().toUtc();
+    final todayUtcStart = DateTime.utc(nowUtc.year, nowUtc.month, nowUtc.day);
+    return openTime >= todayUtcStart.millisecondsSinceEpoch;
+  }
+
+  List<Kline> _barsUpToDate(List<Kline> bars, int currentDate) {
+    return bars.where((item) => item.openTime <= currentDate).toList();
+  }
+
+  CoinData _coinFromBar(String symbol, Kline bar) {
+    final priceChange = bar.close - bar.open;
+    final priceChangePercent =
+        bar.open <= 0 ? 0.0 : ((bar.close - bar.open) / bar.open) * 100;
+    return CoinData(
+      symbol: symbol,
+      lastPrice: bar.close,
+      priceChange: priceChange,
+      priceChangePercent: priceChangePercent,
+      highPrice: bar.high,
+      lowPrice: bar.low,
+      openPrice: bar.open,
+      quoteVolume: bar.quoteVolume,
+      volume: bar.volume,
+      count: bar.tradeCount,
+    );
+  }
+
+  double _periodReturnFromBars(List<Kline> bars, int period) {
+    if (bars.length <= period) return 0.0;
+    final start = bars[bars.length - period - 1].close;
+    final end = bars.last.close;
+    if (start <= 0) return 0.0;
+    return ((end - start) / start) * 100;
+  }
+
+  double _safeMedian(List<double> values) {
+    if (values.isEmpty) return 0.0;
+    final sorted = [...values]..sort();
+    final mid = sorted.length ~/ 2;
+    if (sorted.length.isOdd) return sorted[mid];
+    return (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+
+  DateTime _leaderPredictionTargetDate(DateTime recordedAt) {
+    final utc = recordedAt.toUtc();
+    return DateTime.utc(utc.year, utc.month, utc.day)
+        .add(const Duration(days: 1));
+  }
+
+  String _leaderPredictionRecordId(DateTime targetDateUtc) {
+    final value = targetDateUtc.toIso8601String();
+    return 'leader_prediction|${value.substring(0, 10)}';
   }
 
   Future<_StartupStageSelection> _selectStartupSignalStages({

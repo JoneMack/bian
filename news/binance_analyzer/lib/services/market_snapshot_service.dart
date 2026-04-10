@@ -3,14 +3,18 @@ import '../models/market_snapshot.dart';
 import '../models/strategy_snapshot.dart';
 import '../utils/coin_analyzer.dart';
 import 'binance_service.dart';
+import 'leader_prediction_service.dart';
 import 'recommendation_engine.dart';
 
 class MarketSnapshotService {
   final BinanceService _binance;
+  final LeaderPredictionService _leaderPrediction;
 
   MarketSnapshotService({
     BinanceService? binance,
-  }) : _binance = binance ?? BinanceService();
+    LeaderPredictionService? leaderPrediction,
+  })  : _binance = binance ?? BinanceService(),
+        _leaderPrediction = leaderPrediction ?? LeaderPredictionService();
 
   Future<MarketSnapshot> buildSnapshot({
     List<String>? requestedSymbols,
@@ -46,6 +50,12 @@ class MarketSnapshotService {
           limit: 72,
           forceRefresh: forceRefresh,
         ),
+        _binance.fetchWatchlistKlines(
+          symbols: const ['BTCUSDT'],
+          interval: '1d',
+          limit: 60,
+          forceRefresh: forceRefresh,
+        ),
       ]);
 
       final engine = RecommendationEngine.analyze(
@@ -55,11 +65,17 @@ class MarketSnapshotService {
         policy: policy ?? EntrySignalPolicy.defaultPolicy,
       );
 
-      analyzed = engine.rankedCoins;
-      top3 = engine.top3;
+      final leaderPrediction = _leaderPrediction.analyze(
+        currentCoins: engine.rankedCoins,
+        dailyHistory: histories[0],
+        btcDailyHistory: histories[2]['BTCUSDT'] ?? const [],
+      );
+
+      analyzed = leaderPrediction.rankedCoins;
+      top3 = leaderPrediction.top3;
       engineReport = engine.report;
-      entryAlerts = engine.entryAlerts;
-      exitAlerts = engine.exitAlerts;
+      entryAlerts = _buildLeaderPredictionEntryAlerts(leaderPrediction);
+      exitAlerts = const [];
     } catch (_) {
       analyzed = CoinAnalyzer.analyze(coins);
       top3 = CoinAnalyzer.top3Picks(analyzed);
@@ -86,5 +102,29 @@ class MarketSnapshotService {
     final ordered = results.toList();
     ordered.sort();
     return ordered;
+  }
+
+  List<EntryAlertSignal> _buildLeaderPredictionEntryAlerts(
+    LeaderPredictionResult result,
+  ) {
+    if (result.regimeStatus != 'recommend') {
+      return const [];
+    }
+
+    return result.top3.take(3).map((coin) {
+      return EntryAlertSignal(
+        symbol: coin.displayName,
+        timingLabel: coin.timingLabel.isEmpty ? '等待确认' : coin.timingLabel,
+        timingReason: coin.timingReason,
+        currentPrice: coin.lastPrice,
+        dayChangePercent: coin.priceChangePercent,
+        totalScore: coin.score,
+        entryScore: coin.entryScore,
+        volumeRatio: 0,
+        breakoutDistance: 0,
+        pullbackPercent: 0,
+        shouldNotify: true,
+      );
+    }).toList();
   }
 }

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:binance_analyzer/models/coin_data.dart';
 import 'package:binance_analyzer/models/strategy_snapshot.dart';
 import 'package:binance_analyzer/services/binance_service.dart';
+import 'package:binance_analyzer/services/leader_prediction_service.dart';
 import 'package:binance_analyzer/services/market_bottom_detector_service.dart';
 import 'package:binance_analyzer/services/recommendation_engine.dart';
 import 'package:binance_analyzer/services/signal_runner_service.dart';
@@ -482,6 +483,114 @@ void main() {
     );
   });
 
+  test('publishLeaderPrediction sends top1 and top3 body to feishu', () async {
+    final client = MockClient((request) async {
+      final payload = jsonDecode(request.body) as Map<String, dynamic>;
+      final text =
+          (payload['content'] as Map<String, dynamic>)['text'] as String;
+      expect(text, contains('下一根日线领涨预测'));
+      expect(text, contains('Top1: FET'));
+      expect(text, contains('Top3: FET, LINK, TON'));
+      return http.Response('{"code":0,"msg":"success"}', 200);
+    });
+
+    final service = SignalRunnerService(httpClient: client);
+    final result = await service.publishLeaderPrediction(
+      result: _leaderPredictionFixture(),
+      provider: PushProvider.feishu,
+      feishuWebhookUrl:
+          'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook',
+    );
+
+    expect(result.sent, isTrue);
+    expect(result.provider, 'feishu');
+    expect(result.status, 'sent');
+  });
+
+  test('refreshLeaderPredictionLog settles records and writes summary',
+      () async {
+    final tempDir =
+        await Directory.systemTemp.createTemp('leader-prediction-test-');
+    addTearDown(() => tempDir.delete(recursive: true));
+
+    final logPath = '${tempDir.path}/leader_prediction_log.json';
+    final statsPath = '${tempDir.path}/leader_prediction_stats.json';
+    final bars = _buildSampleBars(
+      start: DateTime.utc(2026, 1, 1),
+      closes: [
+        for (var i = 0; i < 33; i += 1) 1.00 + i * 0.01,
+        1.60,
+        1.68,
+        1.75,
+      ],
+    );
+    final weakerBars = _buildSampleBars(
+      start: DateTime.utc(2026, 1, 1),
+      closes: [
+        for (var i = 0; i < 36; i += 1) 1.00 + i * 0.003,
+      ],
+    );
+    final btcBars = _buildSampleBars(
+      start: DateTime.utc(2026, 1, 1),
+      closes: [
+        for (var i = 0; i < 36; i += 1) 80000 + i * 120,
+      ],
+    );
+    final targetDate = DateTime.fromMillisecondsSinceEpoch(
+      bars[34].openTime,
+      isUtc: true,
+    ).toIso8601String();
+
+    await File(logPath).writeAsString(
+      jsonEncode({
+        'updatedAt': DateTime.now().toIso8601String(),
+        'records': [
+          {
+            'id': 'leader_prediction|2026-02-04',
+            'recordedAt': DateTime.utc(2026, 2, 3).toIso8601String(),
+            'predictionWindow': 'next_binance_daily_candle',
+            'signalType': 'leader_prediction',
+            'targetCandleAt': targetDate,
+            'top1Symbol': 'FET',
+            'top3Symbols': ['FET', 'LINK', 'TON'],
+            'totalScore': 0.82,
+            'componentScores': const {'momentum': 0.88},
+            'regimeStatus': 'recommend',
+            'status': 'pending',
+          }
+        ],
+      }),
+    );
+
+    final service = SignalRunnerService();
+    final payload = await service.refreshLeaderPredictionLog(
+      path: logPath,
+      statsPath: statsPath,
+      dailyHistory: {
+        'FETUSDT': bars,
+        'LINKUSDT': weakerBars,
+        'TONUSDT': weakerBars,
+      },
+      btcDailyHistory: btcBars,
+      lookbackDays: 10,
+    );
+
+    final records =
+        (await service.loadJsonArtifact(logPath))['records'] as List<dynamic>;
+    final record = Map<String, dynamic>.from(records.first as Map);
+    final summary = payload['summary'] as Map<String, dynamic>;
+    final benchmarks = payload['benchmarks'] as List<dynamic>;
+
+    expect(record['status'], 'settled');
+    expect(record['actualLeader'], 'FET');
+    expect(record['top1Hit'], isTrue);
+    expect(summary['totalDays'], greaterThan(0));
+    expect(summary.containsKey('top1HitRate'), isTrue);
+    expect(summary.containsKey('recent20Top1HitRate'), isTrue);
+    expect(benchmarks, hasLength(4));
+    expect(await File(statsPath).exists(), isTrue);
+  });
+
   test('recordClientSignalAction writes summary and dedupes same signal',
       () async {
     final tempDir =
@@ -878,4 +987,111 @@ class _FakeMarketBottomDetectorService extends MarketBottomDetectorService {
   }) {
     return alert;
   }
+}
+
+LeaderPredictionResult _leaderPredictionFixture() {
+  final coin = CoinData(
+    symbol: 'FETUSDT',
+    lastPrice: 1.23,
+    priceChange: 0.08,
+    priceChangePercent: 6.8,
+    highPrice: 1.25,
+    lowPrice: 1.18,
+    openPrice: 1.15,
+    quoteVolume: 12000000,
+    volume: 9000000,
+    count: 4200,
+    score: 0.82,
+    historicalScore: 0.88,
+    entryScore: 0.81,
+    recommendation: '可推荐',
+    reason: '动量 88 | 趋势 81 | 低波动 72 | 量能 79',
+    timingLabel: '下一根日线领涨预测',
+    timingReason: '14d +12.3% · 7d +5.6% · 量比 1.24x',
+  );
+
+  final second = CoinData(
+    symbol: 'LINKUSDT',
+    lastPrice: 12.3,
+    priceChange: 0.2,
+    priceChangePercent: 1.4,
+    highPrice: 12.6,
+    lowPrice: 11.9,
+    openPrice: 12.1,
+    quoteVolume: 8000000,
+    volume: 6000000,
+    count: 3200,
+    score: 0.76,
+    recommendation: '可推荐',
+    timingLabel: '下一根日线领涨预测',
+  );
+
+  final third = CoinData(
+    symbol: 'TONUSDT',
+    lastPrice: 6.2,
+    priceChange: 0.1,
+    priceChangePercent: 1.1,
+    highPrice: 6.3,
+    lowPrice: 6.0,
+    openPrice: 6.1,
+    quoteVolume: 7000000,
+    volume: 5000000,
+    count: 2800,
+    score: 0.71,
+    recommendation: '可推荐',
+    timingLabel: '下一根日线领涨预测',
+  );
+
+  return LeaderPredictionResult(
+    generatedAt: DateTime(2026, 4, 10, 12),
+    rankedCoins: [coin, second, third],
+    top3: [coin, second, third],
+    regimeStatus: 'recommend',
+    regimeReason: '市场状态配合，允许输出下一根日线领涨预测。',
+    marketBreadth: 0.62,
+    medianSevenDayReturn: 4.2,
+    btcDistanceToSma20: 1.8,
+    summary: {
+      'mode': 'leader_prediction',
+      'regimeStatus': 'recommend',
+      'top1Symbol': 'FET',
+      'top3Symbols': ['FET', 'LINK', 'TON'],
+      'top1ComponentScores': {
+        'momentum': 0.88,
+        'trend': 0.81,
+        'lowVol': 0.72,
+        'volumeHealth': 0.79,
+        'ret14': 12.3,
+        'ret7': 5.6,
+        'volumeRatio': 1.24,
+        'distanceToHigh10': -1.4,
+      },
+    },
+  );
+}
+
+List<Kline> _buildSampleBars({
+  required DateTime start,
+  required List<double> closes,
+}) {
+  final bars = <Kline>[];
+  for (var i = 0; i < closes.length; i += 1) {
+    final open = i == 0 ? closes[i] * 0.98 : closes[i - 1];
+    final close = closes[i];
+    final openTime = start.add(Duration(days: i)).millisecondsSinceEpoch;
+    bars.add(
+      Kline(
+        openTime: openTime,
+        open: open,
+        high: close * 1.02,
+        low: open * 0.98,
+        close: close,
+        volume: 100000 + i * 2000,
+        closeTime: openTime + const Duration(days: 1).inMilliseconds - 1,
+        quoteVolume: 2000000 + i * 50000,
+        tradeCount: 1200 + i * 10,
+      ),
+    );
+  }
+  return bars;
 }

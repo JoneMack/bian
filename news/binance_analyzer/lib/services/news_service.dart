@@ -77,6 +77,29 @@ class NewsService {
     'LTC': ['LTC', 'LITECOIN'],
   };
 
+  static const Set<String> _ignoredSymbolTokens = {
+    'BINANCE',
+    'MARKET',
+    'MARKETS',
+    'CRYPTO',
+    'TOKEN',
+    'TOKENS',
+    'COIN',
+    'COINS',
+    'ETF',
+    'ETFS',
+    'SEC',
+    'FED',
+    'CPI',
+    'USD',
+    'USDT',
+    'AI',
+    'NEWS',
+    'BREAKING',
+    'HOT',
+    'SPOT',
+  };
+
   static const Map<String, double> _bullishKeywords = {
     'listing': 0.42,
     'listings': 0.42,
@@ -199,6 +222,119 @@ class NewsService {
         return b.publishedAt.compareTo(a.publishedAt);
       });
     return candidates.take(maxCandidates).toList();
+  }
+
+  Map<String, dynamic> buildPredictiveSignalSummary(
+    List<NewsItem> items, {
+    int maxSymbolsPerSide = 4,
+    Duration maxAge = const Duration(hours: 12),
+  }) {
+    final now = DateTime.now();
+    final recent = items
+        .map(_enrichSignalAssessment)
+        .where((item) => now.difference(item.publishedAt) <= maxAge)
+        .toList()
+      ..sort((a, b) {
+        final byScore = b.impactScore.compareTo(a.impactScore);
+        if (byScore != 0) return byScore;
+        return b.publishedAt.compareTo(a.publishedAt);
+      });
+
+    final symbolScores = <String, double>{};
+    final symbolEvents = <String, Set<String>>{};
+    final symbolHeadlines = <String, List<String>>{};
+    final symbolLatestAt = <String, DateTime>{};
+    final marketEvents = <String>{};
+    final marketHeadlines = <String>[];
+    var marketScore = 0.0;
+
+    for (final item in recent) {
+      if (item.impactDirection == 'neutral' || item.impactScore < 0.52) {
+        continue;
+      }
+
+      final signedScore = item.impactDirection == 'bullish'
+          ? item.impactScore
+          : -item.impactScore;
+      final age = now.difference(item.publishedAt);
+      final recencyFactor = age.inHours <= 2
+          ? 1.0
+          : age.inHours <= 6
+              ? 0.86
+              : 0.74;
+      final weightedScore = signedScore * recencyFactor;
+
+      if (item.relatedSymbols.isEmpty) {
+        marketScore += weightedScore;
+        marketEvents.add(item.eventSummary);
+        if (!marketHeadlines.contains(item.displayTitle)) {
+          marketHeadlines.add(item.displayTitle);
+        }
+        continue;
+      }
+
+      for (final symbol in item.relatedSymbols) {
+        symbolScores[symbol] = (symbolScores[symbol] ?? 0.0) + weightedScore;
+        symbolEvents
+            .putIfAbsent(symbol, () => <String>{})
+            .add(item.eventSummary);
+        symbolHeadlines.putIfAbsent(symbol, () => <String>[]);
+        if (!symbolHeadlines[symbol]!.contains(item.displayTitle)) {
+          symbolHeadlines[symbol]!.add(item.displayTitle);
+        }
+        final latestAt = symbolLatestAt[symbol];
+        if (latestAt == null || item.publishedAt.isAfter(latestAt)) {
+          symbolLatestAt[symbol] = item.publishedAt;
+        }
+      }
+    }
+
+    List<Map<String, dynamic>> summarizeSymbols(bool bullish) {
+      final entries = symbolScores.entries.where((entry) {
+        return bullish ? entry.value >= 0.58 : entry.value <= -0.58;
+      }).toList()
+        ..sort((a, b) =>
+            bullish ? b.value.compareTo(a.value) : a.value.compareTo(b.value));
+
+      return entries.take(maxSymbolsPerSide).map((entry) {
+        final symbol = entry.key;
+        return {
+          'symbol': symbol,
+          'direction': bullish ? 'bullish' : 'bearish',
+          'score': entry.value,
+          'reasons':
+              (symbolEvents[symbol] ?? const <String>{}).take(3).toList(),
+          'headlines':
+              (symbolHeadlines[symbol] ?? const <String>[]).take(2).toList(),
+          'latestPublishedAt': symbolLatestAt[symbol]?.toIso8601String(),
+        };
+      }).toList();
+    }
+
+    final bullishSymbols = summarizeSymbols(true);
+    final bearishSymbols = summarizeSymbols(false);
+    final marketDirection = marketScore >= 0.5
+        ? 'bullish'
+        : marketScore <= -0.5
+            ? 'bearish'
+            : 'neutral';
+    final marketReason =
+        marketEvents.isEmpty ? '暂无足够强的宏观级新闻驱动' : marketEvents.take(3).join('、');
+
+    return {
+      'checkedAt': now.toIso8601String(),
+      'maxAgeHours': maxAge.inHours,
+      'marketDirection': marketDirection,
+      'marketScore': marketScore,
+      'marketReason': marketReason,
+      'marketHeadlines': marketHeadlines.take(3).toList(),
+      'bullishSymbols': bullishSymbols,
+      'bearishSymbols': bearishSymbols,
+      'topSignals': recent.take(5).map((item) => item.toJson()).toList(),
+      'actionable': marketDirection != 'neutral' ||
+          bullishSymbols.isNotEmpty ||
+          bearishSymbols.isNotEmpty,
+    };
   }
 
   Future<List<NewsItem>> _hydrateArticleBodies(List<NewsItem> items) async {
@@ -348,7 +484,8 @@ class NewsService {
   NewsItem _decorateNewsItem(NewsItem item, List<String> relatedSymbols) {
     final text = '${item.title} ${item.body}'.toUpperCase();
     final mentions = relatedSymbols
-        .where((symbol) => symbol.isNotEmpty && text.contains(symbol))
+        .where(
+            (symbol) => symbol.isNotEmpty && _containsAliasToken(text, symbol))
         .toList();
     final mergedTags = <String>{...item.tags, ...mentions}.toList();
 
@@ -472,15 +609,46 @@ class NewsService {
   List<String> _extractRelatedSymbols(String text, List<String> tags) {
     final upper = text.toUpperCase();
     final tagSet = tags.map((item) => item.toUpperCase()).toSet();
-    final related = <String>[];
+    final related = <String>{};
     for (final entry in _symbolAliases.entries) {
-      final matchedAlias = entry.value.any(upper.contains);
+      final matchedAlias =
+          entry.value.any((alias) => _containsAliasToken(upper, alias));
       if (matchedAlias || tagSet.contains(entry.key)) {
         related.add(entry.key);
       }
     }
-    related.sort();
-    return related;
+
+    for (final rawTag in tagSet) {
+      final normalized = _normalizeSymbolCandidate(rawTag);
+      if (normalized.isEmpty || _ignoredSymbolTokens.contains(normalized)) {
+        continue;
+      }
+      related.add(normalized);
+    }
+
+    final ordered = related.toList()..sort();
+    return ordered;
+  }
+
+  bool _containsAliasToken(String text, String alias) {
+    final normalized = alias.trim().toUpperCase();
+    if (normalized.isEmpty) return false;
+    final escaped = RegExp.escape(normalized)
+        .replaceAll(r'\ ', r'[\s\-/]*')
+        .replaceAll(r'\.', r'[\s\./-]*');
+    final pattern = RegExp('(^|[^A-Z0-9])$escaped(?=[^A-Z0-9]|\\b)');
+    return pattern.hasMatch(text);
+  }
+
+  String _normalizeSymbolCandidate(String raw) {
+    final token = raw
+        .trim()
+        .toUpperCase()
+        .replaceAll(RegExp(r'[^A-Z0-9]'), '')
+        .replaceAll('USDT', '');
+    if (token.length < 2 || token.length > 10) return '';
+    if (RegExp(r'^[0-9]+$').hasMatch(token)) return '';
+    return token;
   }
 
   String _eventSummaryFrom(String text, String impactDirection) {

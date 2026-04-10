@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'services/backend_api_service.dart';
 import 'services/notification_service.dart';
 import 'screens/main_nav_screen.dart';
 import 'theme/app_theme.dart';
@@ -21,6 +22,7 @@ void main() async {
   ));
 
   await NotificationService.instance.initialize();
+  await BackendApiService.initialize();
 
   runApp(const BinanceAnalyzerApp());
 }

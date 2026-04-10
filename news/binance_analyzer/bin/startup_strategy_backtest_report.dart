@@ -83,8 +83,8 @@ Future<void> main(List<String> args) async {
   stdout.writeln('');
   stdout.writeln('=== Startup Strategy Backtest ===');
   stdout.writeln('Window: $windowDays 天');
-  stdout.writeln('Policy: $policySelection.summary');
-  stdout.writeln('Samples: $report.sampleCount');
+  stdout.writeln('Policy: ${policySelection.summary}');
+  stdout.writeln('Samples: ${report.sampleCount}');
   stdout.writeln('Win rate: ${(report.winRate * 100).toStringAsFixed(1)}%');
   stdout.writeln(
     'Avg signal return: ${(report.avgSignalReturn * 100).toStringAsFixed(2)}%',

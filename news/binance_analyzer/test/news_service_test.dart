@@ -172,4 +172,53 @@ void main() {
     expect(items.first.eventSummary, contains('安全事件'));
     expect(items.first.relatedSymbols, contains('SOL'));
   });
+
+  test('buildPredictiveSignalSummary extracts watchlist symbol tags', () {
+    final service = NewsService();
+    final summary = service.buildPredictiveSignalSummary([
+      NewsItem(
+        id: '3',
+        title: 'Binance announces MYX listing and trading support',
+        body:
+            'Breaking news: MYX token will start spot trading on Binance after the new listing announcement.',
+        translatedTitle: '币安宣布上线 MYX 并开放现货交易',
+        translatedBody: '突发：币安宣布上线 MYX，市场预期短线成交量放大。',
+        url: 'https://example.com/myx-listing',
+        source: 'Binance',
+        imageUrl: '',
+        publishedAt: DateTime.now().subtract(const Duration(minutes: 20)),
+        tags: const ['MYX', 'Binance'],
+        isHot: true,
+      ),
+    ]);
+
+    final bullish = (summary['bullishSymbols'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    expect(summary['actionable'], isTrue);
+    expect(bullish, isNotEmpty);
+    expect(bullish.first['symbol'], 'MYX');
+  });
+
+  test('buildPredictiveSignalSummary aggregates macro bearish outlook', () {
+    final service = NewsService();
+    final summary = service.buildPredictiveSignalSummary([
+      NewsItem(
+        id: '4',
+        title: 'Markets slide as hotter CPI sparks hawkish rate hike fears',
+        body:
+            'Crypto markets dropped after hotter CPI data, hawkish Fed guidance, exchange outflows and broad risk-off sentiment.',
+        translatedTitle: 'CPI 偏热引发加息担忧，市场回落',
+        translatedBody: '更高的 CPI、偏鹰派联储表态和资金流出导致加密市场整体承压。',
+        url: 'https://example.com/macro-bearish',
+        source: 'Cointelegraph',
+        imageUrl: '',
+        publishedAt: DateTime.now().subtract(const Duration(minutes: 35)),
+        tags: const ['CPI', 'Fed', 'Markets'],
+        isHot: true,
+      ),
+    ]);
+
+    expect(summary['marketDirection'], 'bearish');
+    expect(summary['actionable'], isTrue);
+  });
 }

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/market_snapshot.dart';
 import '../models/news_item.dart';
@@ -34,7 +35,12 @@ class SignalActionSubmissionResult {
 
 class BackendApiService {
   static const String _rawBaseUrl =
-      String.fromEnvironment('BACKEND_BASE_URL', defaultValue: '');
+      String.fromEnvironment(
+        'BACKEND_BASE_URL',
+        defaultValue: 'http://124.221.66.75',
+      );
+  static const String _prefsKey = 'backend_base_url_v1';
+  static String? _cachedBaseUrl;
 
   final http.Client _client;
   final String? _baseUrlOverride;
@@ -46,7 +52,30 @@ class BackendApiService {
         _baseUrlOverride = _normalizeBaseUrl(baseUrlOverride);
 
   static String? get baseUrl {
-    return _normalizeBaseUrl(_rawBaseUrl);
+    return _cachedBaseUrl ?? _normalizeBaseUrl(_rawBaseUrl);
+  }
+
+  static Future<void> initialize() async {
+    final prefs = await SharedPreferences.getInstance();
+    _cachedBaseUrl = _normalizeBaseUrl(prefs.getString(_prefsKey));
+  }
+
+  static Future<void> saveBaseUrl(String value) async {
+    final normalized = _normalizeBaseUrl(value);
+    final prefs = await SharedPreferences.getInstance();
+    if (normalized == null) {
+      _cachedBaseUrl = null;
+      await prefs.remove(_prefsKey);
+      return;
+    }
+    _cachedBaseUrl = normalized;
+    await prefs.setString(_prefsKey, normalized);
+  }
+
+  static Future<void> clearBaseUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    _cachedBaseUrl = null;
+    await prefs.remove(_prefsKey);
   }
 
   String? get resolvedBaseUrl => _baseUrlOverride ?? baseUrl;
