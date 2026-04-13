@@ -1,6 +1,7 @@
 import 'dart:math';
 
 import '../models/coin_data.dart';
+import '../utils/technical_indicators.dart';
 import 'binance_service.dart';
 
 class StartupScannerService {
@@ -220,6 +221,24 @@ class StartupScannerService {
           0.000001,
         );
 
+    // 计算技术指标
+    final dailyClosesList = dailyCloses;
+    final dailyHighsList = dailyBars.map((b) => b.high).toList();
+    final dailyLowsList = dailyBars.map((b) => b.low).toList();
+    final dailyVolumesList = dailyBars.map((b) => b.quoteVolume).toList();
+    final hourlyClosesList = hourlyCloses;
+    final dailyRsi = TechnicalIndicators.rsiLatest(dailyClosesList);
+    final hourlyRsi = TechnicalIndicators.rsiLatest(hourlyClosesList);
+    final dailyMacd = TechnicalIndicators.macdLatest(dailyClosesList);
+    final hourlyMacd = TechnicalIndicators.macdLatest(hourlyClosesList);
+    final bb = TechnicalIndicators.bollingerLatest(dailyClosesList);
+    final adxVal = dailyHighsList.length >= 30
+        ? TechnicalIndicators.adxLatest(
+            dailyHighsList, dailyLowsList, dailyClosesList)
+        : 25.0;
+    final obvTrend =
+        TechnicalIndicators.obvTrendScore(dailyClosesList, dailyVolumesList);
+
     return _RawStartupProfile(
       coin: coin,
       symbol: coin.displayName,
@@ -236,6 +255,16 @@ class StartupScannerService {
       nearTermPivotDistance:
           high10 <= 0 ? 0 : ((coin.lastPrice - high10) / high10) * 100,
       volumeRatio: volumeRatio,
+      dailyRsi: dailyRsi,
+      hourlyRsi: hourlyRsi,
+      dailyMacdHistogram: dailyMacd.histogram,
+      dailyMacdCrossover: dailyMacd.crossover,
+      hourlyMacdHistogram: hourlyMacd.histogram,
+      hourlyMacdCrossover: hourlyMacd.crossover,
+      bollingerPercentB: bb.percentB,
+      bollingerBandwidth: bb.bandwidth,
+      adx: adxVal,
+      obvTrend: obvTrend,
     );
   }
 
@@ -282,6 +311,57 @@ class StartupScannerService {
             marketScore * 0.14)
         .clamp(0.0, 1.0);
 
+    // 新增：RSI 评分 — 超卖区（30-50）适合启动买入，超买（>70）惩罚
+    double rsiScore;
+    final avgRsi = (profile.dailyRsi * 0.6 + profile.hourlyRsi * 0.4);
+    if (avgRsi <= 30) {
+      rsiScore = 0.70;
+    } else if (avgRsi <= 50) {
+      rsiScore = 0.70 + (avgRsi - 30) / 20 * 0.30;
+    } else if (avgRsi <= 65) {
+      rsiScore = 0.70;
+    } else if (avgRsi <= 75) {
+      rsiScore = 0.70 - (avgRsi - 65) / 10 * 0.35;
+    } else {
+      rsiScore = 0.20;
+    }
+
+    // 新增：MACD 信号评分
+    double macdScore = 0.5;
+    if (profile.dailyMacdCrossover || profile.hourlyMacdCrossover) {
+      macdScore = 0.95; // 金叉
+    } else if (profile.dailyMacdHistogram > 0 && profile.hourlyMacdHistogram > 0) {
+      macdScore = 0.75; // 双周期正向
+    } else if (profile.hourlyMacdHistogram > 0) {
+      macdScore = 0.60; // 短期正向
+    } else if (profile.dailyMacdHistogram < 0 && profile.hourlyMacdHistogram < 0) {
+      macdScore = 0.15; // 双周期负向
+    }
+
+    // 新增：布林带蓄势评分
+    double bbSqueezeScore = 0.5;
+    if (profile.bollingerBandwidth < 0.03) {
+      bbSqueezeScore = 0.95; // 极窄带宽，即将突破
+    } else if (profile.bollingerBandwidth < 0.05) {
+      bbSqueezeScore = 0.80;
+    } else if (profile.bollingerBandwidth < 0.08) {
+      bbSqueezeScore = 0.55;
+    } else {
+      bbSqueezeScore = 0.30;
+    }
+    // 价格在下轨附近且带宽收窄 → 额外加分
+    if (profile.bollingerPercentB < 0.3 && profile.bollingerBandwidth < 0.05) {
+      bbSqueezeScore = (bbSqueezeScore + 0.15).clamp(0.0, 1.0);
+    }
+
+    // 新增：ADX 趋势强度
+    final adxBonus = profile.adx > 25 && trendScore >= 0.6
+        ? 0.08 // 强趋势且方向正确时加分
+        : 0.0;
+
+    // 新增：OBV 量价配合
+    final obvBonus = profile.obvTrend > 0.65 ? 0.05 : 0.0;
+
     final overextendedPenalty = profile.momentum30 > 36 ||
             profile.coin.priceChangePercent > 8.6 ||
             profile.dailyBreakoutDistance > 2.8 ||
@@ -289,17 +369,32 @@ class StartupScannerService {
         ? 0.14
         : 0.0;
     final weakLiquidityPenalty = liquidityRank < 0.18 ? 0.04 : 0.0;
+    // 新增：RSI 超买惩罚
+    final rsiOverboughtPenalty = profile.dailyRsi > 75 || profile.hourlyRsi > 78
+        ? 0.10
+        : 0.0;
 
-    final score = (trendScore * 0.22 +
+    // 调整权重：原指标 70% + 新技术指标 30%
+    final baseScore = (trendScore * 0.22 +
             compressionScore * 0.20 +
             breakoutScore * 0.22 +
             volumeScore * 0.15 +
             pivotScore * 0.11 +
             momentumScore * 0.06 +
             liquidityRank * 0.03 +
-            marketScore * 0.01 -
+            marketScore * 0.01);
+    final techScore = (rsiScore * 0.30 +
+            macdScore * 0.30 +
+            bbSqueezeScore * 0.25 +
+            profile.obvTrend * 0.15);
+
+    final score = (baseScore * 0.70 +
+            techScore * 0.30 +
+            adxBonus +
+            obvBonus -
             weakLiquidityPenalty -
-            overextendedPenalty)
+            overextendedPenalty -
+            rsiOverboughtPenalty)
         .clamp(0.0, 1.0);
 
     final shouldWatch = score >= policy.minWatchScore &&
@@ -353,24 +448,32 @@ class StartupScannerService {
     final reasonParts = <String>[
       '24h额 ${_compactUsd(profile.coin.quoteVolume)}',
       '量比 ${profile.volumeRatio.toStringAsFixed(2)}x',
+      'RSI ${profile.dailyRsi.toStringAsFixed(0)}/${profile.hourlyRsi.toStringAsFixed(0)}',
       '距20日突破位 ${profile.dailyBreakoutDistance >= 0 ? '+' : ''}${profile.dailyBreakoutDistance.toStringAsFixed(2)}%',
-      '距10日枢轴 ${profile.nearTermPivotDistance >= 0 ? '+' : ''}${profile.nearTermPivotDistance.toStringAsFixed(2)}%',
-      '7日动量 ${profile.momentum7 >= 0 ? '+' : ''}${profile.momentum7.toStringAsFixed(1)}%',
-      '30日动量 ${profile.momentum30 >= 0 ? '+' : ''}${profile.momentum30.toStringAsFixed(1)}%',
     ];
 
+    if (profile.dailyMacdCrossover || profile.hourlyMacdCrossover) {
+      reasonParts.add('MACD金叉');
+    } else if (profile.dailyMacdHistogram > 0) {
+      reasonParts.add('MACD柱正向');
+    }
+    if (profile.bollingerBandwidth < 0.04) {
+      reasonParts.add('布林收窄蓄势');
+    }
+    if (profile.adx > 30) {
+      reasonParts.add('强趋势ADX${profile.adx.toStringAsFixed(0)}');
+    }
+    if (profile.obvTrend > 0.65) {
+      reasonParts.add('OBV量价配合');
+    }
     if (compressionScore >= 0.55) {
-      reasonParts.add('波动收缩明显');
+      reasonParts.add('波动收缩');
     }
     if (trendScore >= 0.7) {
-      reasonParts.add('日线/小时线趋势同步');
-    }
-    if (profile.nearTermPivotDistance >= -0.8 &&
-        profile.nearTermPivotDistance <= 1.6) {
-      reasonParts.add('临近短线突破位');
+      reasonParts.add('趋势同步');
     }
     if (marketTrendBreadth >= 0.55) {
-      reasonParts.add('市场趋势配合');
+      reasonParts.add('市场配合');
     }
 
     return StartupScanCandidate(
@@ -1211,6 +1314,17 @@ class _RawStartupProfile {
   final double dailyRange30;
   final double dailyRange7;
   final double volumeRatio;
+  // 新增技术指标
+  final double dailyRsi;
+  final double hourlyRsi;
+  final double dailyMacdHistogram;
+  final bool dailyMacdCrossover;
+  final double hourlyMacdHistogram;
+  final bool hourlyMacdCrossover;
+  final double bollingerPercentB;
+  final double bollingerBandwidth;
+  final double adx;
+  final double obvTrend;
 
   const _RawStartupProfile({
     required this.coin,
@@ -1227,6 +1341,16 @@ class _RawStartupProfile {
     required this.dailyRange30,
     required this.dailyRange7,
     required this.volumeRatio,
+    this.dailyRsi = 50,
+    this.hourlyRsi = 50,
+    this.dailyMacdHistogram = 0,
+    this.dailyMacdCrossover = false,
+    this.hourlyMacdHistogram = 0,
+    this.hourlyMacdCrossover = false,
+    this.bollingerPercentB = 0.5,
+    this.bollingerBandwidth = 0.05,
+    this.adx = 25,
+    this.obvTrend = 0.5,
   });
 }
 

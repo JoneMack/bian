@@ -1,31 +1,36 @@
 import 'dart:math';
 import '../models/coin_data.dart';
+import '../services/binance_service.dart';
+import 'technical_indicators.dart';
 
 /// 币种评分与推荐算法
 ///
 /// 评分维度（满分1.0）：
+///
+/// **基础维度（无K线时使用，权重100%；有K线时降为40%）：**
 ///   1. 动量分 (Momentum)  权重 45%
-///      - 24h涨幅在 +1% ~ +8% 得分最高，说明有上涨趋势但未严重超买
-///      - 大跌（<-5%）大幅拖低得分
-///      - 暴涨（>15%）适度降分（可能回调）
-///
 ///   2. 位置分 (Position)  权重 30%
-///      - 当前价相对24h区间位置（越低越好，代表仍有上涨空间）
-///      - 仅在正动量时加权，避免"越跌越买"陷阱
-///
 ///   3. 成交量分 (Volume)  权重 25%
-///      - 对数归一化成交额，高成交量说明市场活跃，信号更可靠
+///
+/// **技术指标维度（有K线时额外加入，权重60%）：**
+///   1. RSI (18%) — 超卖回升区最佳
+///   2. MACD (18%) — 金叉/柱状图方向
+///   3. EMA趋势 (22%) — 多头排列
+///   4. 布林带 (12%) — 蓄势突破
+///   5. 量能趋势 (12%) — OBV 确认
+///   6. ADX (10%) — 趋势强度
+///   7. RSI背离 (8%) — 底背离加分
 ///
 /// 最终等级：
-///   score ≥ 0.72 → 强烈推荐 🟢🟢
-///   score ≥ 0.58 → 推荐买入 🟢
-///   score ≥ 0.42 → 可以考虑 🟡
-///   score < 0.42 → 暂不推荐 🔴
+///   score ≥ 0.72 → 强烈推荐
+///   score ≥ 0.58 → 推荐买入
+///   score ≥ 0.42 → 可以考虑
+///   score < 0.42 → 暂不推荐
 class CoinAnalyzer {
+  /// 基础分析（仅用24h数据，无K线历史）
   static List<CoinData> analyze(List<CoinData> coins) {
     if (coins.isEmpty) return coins;
 
-    // 预计算统计量
     final volumes = coins.map((c) => c.quoteVolume).toList();
     final logMaxVol = log(volumes.reduce(max) + 1);
     final logMinVol = log(volumes.reduce(min) + 1);
@@ -37,7 +42,6 @@ class CoinAnalyzer {
 
       double score = 0.45 * ms + 0.30 * ps + 0.25 * vs;
 
-      // 奖励：正动量 + 价格在低位区间（强势初期）
       if (coin.priceChangePercent > 0 && coin.rangePosition < 0.45) {
         score *= 1.12;
       }
@@ -48,7 +52,74 @@ class CoinAnalyzer {
       coin.reason = _buildReason(coin, ms, ps, vs);
     }
 
-    // 按评分降序
+    coins.sort((a, b) => b.score.compareTo(a.score));
+    return coins;
+  }
+
+  /// 增强分析（融合K线历史的技术指标）
+  static List<CoinData> analyzeWithHistory(
+    List<CoinData> coins, {
+    required Map<String, List<Kline>> hourlyHistory,
+    Map<String, List<Kline>>? dailyHistory,
+  }) {
+    if (coins.isEmpty) return coins;
+
+    final volumes = coins.map((c) => c.quoteVolume).toList();
+    final logMaxVol = log(volumes.reduce(max) + 1);
+    final logMinVol = log(volumes.reduce(min) + 1);
+
+    for (final coin in coins) {
+      final ms = _momentumScore(coin.priceChangePercent);
+      final ps = _positionScore(coin, ms);
+      final vs = _volumeScore(coin.quoteVolume, logMinVol, logMaxVol);
+      final baseScore = (0.45 * ms + 0.30 * ps + 0.25 * vs).clamp(0.0, 1.0);
+
+      // 尝试获取 K 线历史计算技术指标
+      final hourlyBars = hourlyHistory[coin.symbol];
+      final dailyBars = dailyHistory?[coin.symbol];
+
+      // 优先用日线，回退到小时线
+      final bars = dailyBars ?? hourlyBars;
+      if (bars != null && bars.length >= 30) {
+        final closes = bars.map((b) => b.close).toList();
+        final highs = bars.map((b) => b.high).toList();
+        final lows = bars.map((b) => b.low).toList();
+        final vols = bars.map((b) => b.quoteVolume).toList();
+
+        final techScore = TechnicalIndicators.compositeScore(
+          closes: closes,
+          highs: highs,
+          lows: lows,
+          volumes: vols,
+        );
+
+        // 基础 40% + 技术指标 60%
+        var finalScore = baseScore * 0.40 + techScore.total * 0.60;
+
+        // 奖励：正动量 + 低位 + 技术面向好
+        if (coin.priceChangePercent > 0 &&
+            coin.rangePosition < 0.45 &&
+            techScore.trendScore >= 0.55) {
+          finalScore *= 1.10;
+        }
+
+        coin.score = finalScore.clamp(0.0, 1.0);
+        coin.level = _level(coin.score);
+        coin.recommendation = _label(coin.level);
+        coin.reason = _buildEnhancedReason(coin, ms, ps, vs, techScore);
+      } else {
+        // 无足够 K 线，降级为基础评分
+        var score = baseScore;
+        if (coin.priceChangePercent > 0 && coin.rangePosition < 0.45) {
+          score *= 1.12;
+        }
+        coin.score = score.clamp(0.0, 1.0);
+        coin.level = _level(coin.score);
+        coin.recommendation = _label(coin.level);
+        coin.reason = _buildReason(coin, ms, ps, vs);
+      }
+    }
+
     coins.sort((a, b) => b.score.compareTo(a.score));
     return coins;
   }
@@ -57,38 +128,35 @@ class CoinAnalyzer {
 
   static double _momentumScore(double changePct) {
     if (changePct >= 0) {
-      // 上涨：1%~8% 最佳区间，超过8%适当折扣
       if (changePct <= 1) {
-        return 0.45 + changePct * 0.05; // 0.45~0.50
+        return 0.45 + changePct * 0.05;
       } else if (changePct <= 5) {
-        return 0.50 + ((changePct - 1) / 4) * 0.50; // 0.50~1.00
+        return 0.50 + ((changePct - 1) / 4) * 0.50;
       } else if (changePct <= 10) {
-        return 1.00 - ((changePct - 5) / 5) * 0.20; // 1.00~0.80
+        return 1.00 - ((changePct - 5) / 5) * 0.20;
       } else if (changePct <= 20) {
-        return 0.80 - ((changePct - 10) / 10) * 0.30; // 0.80~0.50
+        return 0.80 - ((changePct - 10) / 10) * 0.30;
       } else {
-        return 0.50; // 暴涨，谨慎
+        return 0.50;
       }
     } else {
-      // 下跌
       if (changePct >= -3) {
-        return 0.45 + (changePct / 3) * 0.15; // 微跌 0.45~0.30
+        return 0.45 + (changePct / 3) * 0.15;
       } else if (changePct >= -8) {
-        return 0.30 + ((changePct + 3) / 5) * 0.20; // 中跌 0.10~0.30
+        return 0.30 + ((changePct + 3) / 5) * 0.20;
       } else {
-        return max(0.0, 0.10 + (changePct + 8) / 20); // 大跌 接近0
+        return max(0.0, 0.10 + (changePct + 8) / 20);
       }
     }
   }
 
   static double _positionScore(CoinData coin, double momentumScore) {
-    // 只在上涨动量下，位置低才加分；下跌时减权避免抄底陷阱
-    final pos = coin.rangePosition; // 0=低位 1=高位
-    final raw = 1.0 - pos; // 越低位得分越高
+    final pos = coin.rangePosition;
+    final raw = 1.0 - pos;
     if (momentumScore >= 0.5) {
-      return raw; // 正动量时完整使用位置分
+      return raw;
     } else {
-      return raw * (momentumScore / 0.5) * 0.5; // 负动量时大幅折减
+      return raw * (momentumScore / 0.5) * 0.5;
     }
   }
 
@@ -147,8 +215,60 @@ class CoinAnalyzer {
     return parts.join('；');
   }
 
+  static String _buildEnhancedReason(
+      CoinData coin, double ms, double ps, double vs, TechnicalScore tech) {
+    final List<String> parts = [];
+    final chg = coin.priceChangePercent;
+
+    if (chg > 8) {
+      parts.add('涨幅偏大(${chg.toStringAsFixed(1)}%)');
+    } else if (chg > 0) {
+      parts.add('+${chg.toStringAsFixed(1)}%');
+    } else {
+      parts.add('${chg.toStringAsFixed(1)}%');
+    }
+
+    // 技术指标摘要
+    if (tech.trendScore >= 0.75) {
+      parts.add('EMA多头排列');
+    } else if (tech.trendScore <= 0.35) {
+      parts.add('EMA空头');
+    }
+
+    if (tech.macdScore >= 0.80) {
+      parts.add('MACD强势');
+    } else if (tech.macdScore <= 0.25) {
+      parts.add('MACD弱势');
+    }
+
+    if (tech.rsiScore >= 0.80) {
+      parts.add('RSI超卖回升');
+    } else if (tech.rsiScore <= 0.25) {
+      parts.add('RSI超买');
+    }
+
+    if (tech.bollingerScore >= 0.70) {
+      parts.add('布林带蓄势');
+    }
+
+    if (tech.divergenceScore > 0.3) {
+      parts.add('RSI看涨背离');
+    }
+
+    if (tech.adxScore >= 0.7) {
+      parts.add('强趋势');
+    }
+
+    if (vs > 0.7) {
+      parts.add('量活跃');
+    } else if (vs < 0.3) {
+      parts.add('量偏低');
+    }
+
+    return parts.join('；');
+  }
+
   /// 今日精选：强烈推荐+推荐中最多取3个
-  /// 若不足3个，从「可以考虑」中补充，始终返回最优的
   static List<CoinData> top3Picks(List<CoinData> analyzed) {
     final strong = analyzed
         .where((c) =>
@@ -158,7 +278,6 @@ class CoinAnalyzer {
 
     if (strong.length >= 3) return strong.take(3).toList();
 
-    // 补充「可以考虑」
     final hold = analyzed
         .where((c) => c.level == RecommendationLevel.hold)
         .toList();
