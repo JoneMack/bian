@@ -5,11 +5,13 @@ import 'dart:math';
 import 'package:http/http.dart' as http;
 
 import '../models/coin_data.dart';
+import '../models/news_item.dart';
 import '../models/strategy_snapshot.dart';
 import 'binance_service.dart';
 import 'hourly_replay_service.dart';
 import 'leader_prediction_service.dart';
 import 'market_bottom_detector_service.dart';
+import 'news_service.dart';
 import 'recommendation_engine.dart';
 import 'startup_scanner_service.dart';
 import 'startup_strategy_backtest_service.dart';
@@ -278,6 +280,7 @@ class SignalRunnerService {
   static const defaultLeaderPredictionStatsPath =
       'build/reports/leader_prediction_stats.json';
   static const defaultLeaderPredictionBacktestDays = 60;
+  static const _leaderFallbackExperimentPrefix = 'fallback_';
   static const defaultStartupPredictionEvaluationHours = 24;
   static const Set<String> _trackedPredictionSignalTypes = {
     'startup_buy',
@@ -290,6 +293,7 @@ class SignalRunnerService {
   final StartupScannerService _startupScanner;
   final MarketBottomDetectorService _marketBottomDetector;
   final StartupStrategyBacktestService _startupStrategyBacktest;
+  final NewsService _newsService;
   final http.Client _httpClient;
 
   SignalRunnerService({
@@ -299,6 +303,7 @@ class SignalRunnerService {
     StartupScannerService? startupScanner,
     MarketBottomDetectorService? marketBottomDetector,
     StartupStrategyBacktestService? startupStrategyBacktest,
+    NewsService? newsService,
     http.Client? httpClient,
   })  : _binance = binance ?? BinanceService(),
         _replay = replay ?? HourlyReplayService(),
@@ -308,6 +313,7 @@ class SignalRunnerService {
             marketBottomDetector ?? MarketBottomDetectorService(),
         _startupStrategyBacktest =
             startupStrategyBacktest ?? StartupStrategyBacktestService(),
+        _newsService = newsService ?? NewsService(),
         _httpClient = httpClient ?? http.Client();
 
   Future<EntrySignalPolicy> loadOptimizedPolicy({
@@ -888,10 +894,11 @@ class SignalRunnerService {
     Duration pushDedupeWindow = const Duration(hours: 6),
   }) async {
     final generatedAt = DateTime.now();
-    final coins = await _binance.fetchTickers(symbols: requestedSymbols);
+    final resolvedSymbols = _resolveLeaderPredictionSymbols(requestedSymbols);
+    final coins = await _binance.fetchTickers(symbols: resolvedSymbols);
     final symbols = coins.map((coin) => coin.symbol).toList()..sort();
     if (symbols.isEmpty) {
-      throw StateError('当前没有可用于领涨预测的币种');
+      throw StateError('当前没有可用于次日收益模型的币种');
     }
 
     final historyBars = max(lookbackDays + 45, 120);
@@ -913,17 +920,45 @@ class SignalRunnerService {
 
     final dailyHistory = histories[0];
     final btcDailyHistory = histories[1]['BTCUSDT'] ?? const <Kline>[];
-    final result = _leaderPrediction.analyze(
-      currentCoins: coins,
+    final recentNews = await _safeFetchLeaderNews(symbols);
+    final backtest = _buildLeaderPredictionBacktest(
       dailyHistory: dailyHistory,
       btcDailyHistory: btcDailyHistory,
+      lookbackDays: lookbackDays,
     );
+    final bestExperiment = _asJsonMap(backtest['bestExperiment']);
+    final bestExperimentId = bestExperiment?['id']?.toString() ?? '';
+    final result = bestExperimentId.startsWith(_leaderFallbackExperimentPrefix)
+        ? _buildMomentumFallbackLiveResult(
+            currentCoins: coins,
+            dailyHistory: dailyHistory,
+            btcDailyHistory: btcDailyHistory,
+            days: _fallbackMomentumDays(bestExperiment),
+            fallbackId: bestExperimentId,
+            fallbackLabel:
+                bestExperiment?['label']?.toString() ?? 'Fallback Momentum',
+          )
+        : _leaderPrediction.analyze(
+            currentCoins: coins,
+            dailyHistory: dailyHistory,
+            btcDailyHistory: btcDailyHistory,
+            recentNews: recentNews,
+            experimentConfig: _resolveLeaderExperimentConfig(backtest),
+            forcedCorePoolSymbols: _asStringList(
+              (_asJsonMap(backtest['bestExperiment']) ??
+                  const {})['corePoolSymbols'],
+            ),
+          );
     final payload = _buildLeaderPredictionReportPayload(
       generatedAt: generatedAt,
       result: result,
       lookbackDays: lookbackDays,
       activeSymbols: symbols,
-    );
+    )..addAll({
+        'bestExperiment': backtest['bestExperiment'],
+        'experimentHistory': backtest['experimentHistory'],
+        'experimentSelectionPolicy': backtest['experimentSelectionPolicy'],
+      });
     await _writeJsonFile(reportPath, payload);
 
     await _upsertLeaderPredictionRecord(
@@ -937,6 +972,7 @@ class SignalRunnerService {
       dailyHistory: dailyHistory,
       btcDailyHistory: btcDailyHistory,
       lookbackDays: lookbackDays,
+      precomputedBacktest: backtest,
     );
 
     final pushResult = publishPush
@@ -980,7 +1016,8 @@ class SignalRunnerService {
     String statsPath = defaultLeaderPredictionStatsPath,
     int lookbackDays = defaultLeaderPredictionBacktestDays,
   }) async {
-    final coins = await _binance.fetchTickers(symbols: requestedSymbols);
+    final resolvedSymbols = _resolveLeaderPredictionSymbols(requestedSymbols);
+    final coins = await _binance.fetchTickers(symbols: resolvedSymbols);
     final symbols = coins.map((coin) => coin.symbol).toList()..sort();
     if (symbols.isEmpty) {
       final emptyPayload = {
@@ -990,13 +1027,22 @@ class SignalRunnerService {
           'windowDays': lookbackDays,
           'totalDays': 0,
           'recommendDays': 0,
+          'watchOnlyDays': 0,
+          'predictionDays': 0,
+          'actionableDays': 0,
           'suppressedDays': 0,
           'suppressRate': 0.0,
           'top1HitRate': 0.0,
           'top3HitRate': 0.0,
+          'actionableTop1HitRate': 0.0,
+          'actionableTop3HitRate': 0.0,
+          'recommendTop1HitRate': 0.0,
+          'recommendTop3HitRate': 0.0,
           'avgPredictedReturn': 0.0,
           'avgLeaderReturn': 0.0,
           'avgExcessVsMedian': 0.0,
+          'actionableAvgPredictedReturn': 0.0,
+          'recommendAvgPredictedReturn': 0.0,
           'recent20Top1HitRate': 0.0,
           'recent20Top3HitRate': 0.0,
           'longestMissStreak': 0,
@@ -1005,11 +1051,17 @@ class SignalRunnerService {
           'currentRegimeStatus': 'stand_aside',
         },
         'benchmarks': const <Map<String, dynamic>>[],
+        'experimentHistory': const <Map<String, dynamic>>[],
+        'bestExperiment': null,
+        'experimentSelectionPolicy': const <String, dynamic>{},
         'liveSummary': {
           'totalRecords': 0,
           'pending': 0,
           'settled': 0,
           'suppressed': 0,
+          'recommend': 0,
+          'watchOnly': 0,
+          'actionable': 0,
         },
         'records': const <Map<String, dynamic>>[],
       };
@@ -1033,12 +1085,18 @@ class SignalRunnerService {
         forceRefresh: true,
       ),
     ]);
+    final backtest = _buildLeaderPredictionBacktest(
+      dailyHistory: histories[0],
+      btcDailyHistory: histories[1]['BTCUSDT'] ?? const <Kline>[],
+      lookbackDays: lookbackDays,
+    );
     return refreshLeaderPredictionLog(
       path: logPath,
       statsPath: statsPath,
       dailyHistory: histories[0],
       btcDailyHistory: histories[1]['BTCUSDT'] ?? const <Kline>[],
       lookbackDays: lookbackDays,
+      precomputedBacktest: backtest,
     );
   }
 
@@ -1048,6 +1106,7 @@ class SignalRunnerService {
     required Map<String, List<Kline>> dailyHistory,
     required List<Kline> btcDailyHistory,
     int lookbackDays = defaultLeaderPredictionBacktestDays,
+    Map<String, dynamic>? precomputedBacktest,
   }) async {
     final existing = await _readJsonFile(path);
     final records = (existing['records'] as List<dynamic>? ?? const [])
@@ -1060,16 +1119,20 @@ class SignalRunnerService {
     );
 
     final liveSummary = _buildLeaderPredictionLiveSummary(records);
-    final backtest = _buildLeaderPredictionBacktest(
-      dailyHistory: dailyHistory,
-      btcDailyHistory: btcDailyHistory,
-      lookbackDays: lookbackDays,
-    );
+    final backtest = precomputedBacktest ??
+        _buildLeaderPredictionBacktest(
+          dailyHistory: dailyHistory,
+          btcDailyHistory: btcDailyHistory,
+          lookbackDays: lookbackDays,
+        );
     final payload = {
       'updatedAt': DateTime.now().toIso8601String(),
       'lookbackDays': lookbackDays,
       'summary': backtest['summary'],
       'benchmarks': backtest['benchmarks'],
+      'experimentHistory': backtest['experimentHistory'],
+      'bestExperiment': backtest['bestExperiment'],
+      'experimentSelectionPolicy': backtest['experimentSelectionPolicy'],
       'liveSummary': liveSummary,
       'records': records.take(240).toList(),
       'backtestRecords': (backtest['records'] as List<dynamic>? ?? const [])
@@ -1084,6 +1147,43 @@ class SignalRunnerService {
     });
     await _writeJsonFile(statsPath, payload);
     return payload;
+  }
+
+  Future<List<NewsItem>> _safeFetchLeaderNews(List<String> symbols) async {
+    try {
+      return await _newsService.fetchNews(
+        limit: 24,
+        categories: symbols
+            .map((item) => item.replaceAll('USDT', '').toUpperCase())
+            .toList(),
+      );
+    } catch (_) {
+      return const <NewsItem>[];
+    }
+  }
+
+  LeaderPredictionExperimentConfig _resolveLeaderExperimentConfig(
+    Map<String, dynamic> backtest,
+  ) {
+    final best = _asJsonMap(backtest['bestExperiment']);
+    final experimentId = best?['id']?.toString() ?? '';
+    if (experimentId.isEmpty) {
+      return LeaderPredictionService.defaultExperimentConfig;
+    }
+    return _leaderPrediction.configById(experimentId);
+  }
+
+  List<String> _resolveLeaderPredictionSymbols(List<String>? requestedSymbols) {
+    final base = (requestedSymbols == null || requestedSymbols.isEmpty)
+        ? BinanceService.defaultLeaderPredictionSymbols
+        : requestedSymbols;
+    final excluded = BinanceService.excludedLeaderPredictionSymbols.toSet();
+    return base
+        .map(BinanceService.toSymbol)
+        .where((item) => item.isNotEmpty && !excluded.contains(item))
+        .toSet()
+        .toList()
+      ..sort();
   }
 
   Future<Map<String, dynamic>> refreshStartupPredictionLog({
@@ -1261,13 +1361,14 @@ class SignalRunnerService {
     String dedupeKey = 'leader_prediction',
   }) async {
     final regimeLabel = _leaderPredictionRegimeLabel(result.regimeStatus);
-    if (result.top3.isEmpty || result.regimeStatus != 'recommend') {
+    if (result.top3.isEmpty || !_isLeaderPredictionPushable(result)) {
       return PushDeliveryResult(
         attempted: false,
         sent: false,
         provider: provider.name,
         status: 'skipped_no_actionable',
-        message: '当前状态为$regimeLabel，仅记录领涨预测，不发送飞书',
+        message:
+            '当前状态为$regimeLabel，且置信度为${_leaderPredictionConfidenceLabel(result.confidence)}，仅记录预测，不发送飞书',
         recordedAt: DateTime.now(),
       );
     }
@@ -1279,12 +1380,12 @@ class SignalRunnerService {
       server: server,
       topic: topic,
       body: body,
-      title: 'Binance Leader Prediction',
+      title: 'Binance Rotation Top1',
       dedupe: dedupe,
       statePath: statePath,
       dedupeWindow: dedupeWindow,
       dedupeKey: dedupeKey,
-      successMessage: '已推送下一根日线领涨预测',
+      successMessage: '已推送明日轮动 Top1 预测',
     );
   }
 
@@ -2655,6 +2756,12 @@ class SignalRunnerService {
       'predictionWindow': 'next_binance_daily_candle',
       'lookbackDays': lookbackDays,
       'activeSymbols': activeSymbols,
+      'modelVersion': result.modelVersion,
+      'confidence': result.confidence,
+      'rotationConfirmed': result.rotationConfirmed,
+      'corePoolSymbols': result.corePoolSymbols,
+      'selectedExperimentId': result.selectedExperimentId,
+      'selectedExperimentLabel': result.selectedExperimentLabel,
       'regimeStatus': result.regimeStatus,
       'regimeLabel': _leaderPredictionRegimeLabel(result.regimeStatus),
       'regimeReason': result.regimeReason,
@@ -2698,9 +2805,11 @@ class SignalRunnerService {
     required LeaderPredictionResult result,
   }) {
     final buffer = StringBuffer()
-      ..writeln('Binance 下一根日线领涨预测')
+      ..writeln('Binance 明日轮动 Top1 预测')
       ..writeln('状态: ${_leaderPredictionRegimeLabel(result.regimeStatus)}')
       ..writeln('结算窗口: 下一根币安日线（UTC 00:00）')
+      ..writeln('模型: ${result.selectedExperimentLabel}')
+      ..writeln('置信度: ${_leaderPredictionConfidenceLabel(result.confidence)}')
       ..writeln('市场判断: ${result.regimeReason}');
 
     final top1 = result.top3.isEmpty ? null : result.top3.first;
@@ -2712,6 +2821,9 @@ class SignalRunnerService {
         )
         ..writeln(
           'Top3: ${result.top3.map((item) => item.displayName).join(', ')}',
+        )
+        ..writeln(
+          '核心池: ${result.corePoolSymbols.take(8).join(', ')}',
         )
         ..writeln('核心原因:');
       for (final line in _leaderPredictionReasonLines(top1, result.summary)) {
@@ -2727,31 +2839,58 @@ class SignalRunnerService {
     Map<String, dynamic> summary,
   ) {
     final components = _top1ComponentScoresFromResult(summary);
-    final momentum = ((_asDouble(components['momentum'])) * 100).round();
+    final rotation = ((_asDouble(components['rotation'])) * 100).round();
     final trend = ((_asDouble(components['trend'])) * 100).round();
+    final compression = ((_asDouble(components['compression'])) * 100).round();
     final lowVol = ((_asDouble(components['lowVol'])) * 100).round();
-    final volumeHealth =
-        ((_asDouble(components['volumeHealth'])) * 100).round();
+    final volume = ((_asDouble(components['volume'])) * 100).round();
+    final risk = ((_asDouble(components['risk'])) * 100).round();
+    final corePool = ((_asDouble(components['corePool'])) * 100).round();
+    final confidence = _leaderPredictionConfidenceLabel(
+      summary['confidence']?.toString() ?? 'low',
+    );
+    final daysSinceLeader = _asDouble(components['daysSinceLeader']).round();
+    final ret5 = _asDouble(components['ret5']);
     final ret14 = _asDouble(components['ret14']);
-    final ret7 = _asDouble(components['ret7']);
     final volumeRatio = _asDouble(components['volumeRatio']);
+    final compressionRatio = _asDouble(components['compressionRatio']);
     final distanceToHigh10 = _asDouble(components['distanceToHigh10']);
+    final distanceToLow10 = _asDouble(components['distanceToLow10']);
     return [
-      '1. ${top1.displayName} 的 14d/7d 相对动量靠前，动量分 $momentum，14d ${ret14 >= 0 ? '+' : ''}${ret14.toStringAsFixed(1)}%，7d ${ret7 >= 0 ? '+' : ''}${ret7.toStringAsFixed(1)}%。',
-      '2. 趋势确认分 $trend，当前结构配合 ${top1.timingLabel}，${top1.timingReason}',
-      '3. 风险过滤后仍保留优势，低波动 $lowVol，量能健康 $volumeHealth，3d/10d 量比 ${volumeRatio.toStringAsFixed(2)}x，距 10d 高点 ${distanceToHigh10.toStringAsFixed(2)}%。',
+      '1. ${top1.displayName} 当前位于核心轮动池，距上次领涨 $daysSinceLeader 天，轮动分 $rotation，核心池分 $corePool，说明已脱离刚领涨后的拥挤段。',
+      '2. 5日动量 ${ret5 >= 0 ? '+' : ''}${ret5.toStringAsFixed(1)}%，14日 ${ret14 >= 0 ? '+' : ''}${ret14.toStringAsFixed(1)}%，趋势分 $trend，压缩分 $compression，压缩比 ${compressionRatio.toStringAsFixed(2)}。',
+      '3. 量能分 $volume，低波动分 $lowVol，风控分 $risk，量比 ${volumeRatio.toStringAsFixed(2)}x，距10日高点 ${distanceToHigh10.toStringAsFixed(2)}%，距10日低点 ${distanceToLow10.toStringAsFixed(2)}%，当前置信度 $confidence。',
     ];
   }
 
   String _leaderPredictionRegimeLabel(String status) {
     switch (status) {
       case 'recommend':
-        return '可推荐';
+        return '可出手';
       case 'watch_only':
-        return '仅观察';
+        return '轻仓观察';
       default:
-        return '不出手';
+        return '只做预测';
     }
+  }
+
+  String _leaderPredictionConfidenceLabel(String value) {
+    switch (value) {
+      case 'high':
+        return '高';
+      case 'medium':
+        return '中';
+      default:
+        return '低';
+    }
+  }
+
+  bool _isLeaderPredictionActionable(String status) {
+    return status == 'recommend';
+  }
+
+  bool _isLeaderPredictionPushable(LeaderPredictionResult result) {
+    return result.regimeStatus == 'recommend' && result.confidence != 'low';
   }
 
   Map<String, dynamic> _top1ComponentScoresFromResult(
@@ -2781,8 +2920,6 @@ class SignalRunnerService {
         record['status']?.toString() != 'settled');
 
     final top1 = result.top3.isEmpty ? null : result.top3.first;
-    final status =
-        result.regimeStatus == 'recommend' ? 'pending' : 'suppressed';
     records.insert(0, {
       'id': id,
       'recordedAt': generatedAt.toIso8601String(),
@@ -2796,7 +2933,15 @@ class SignalRunnerService {
       'regimeStatus': result.regimeStatus,
       'regimeLabel': _leaderPredictionRegimeLabel(result.regimeStatus),
       'regimeReason': result.regimeReason,
-      'status': status,
+      'modelVersion': result.modelVersion,
+      'confidence': result.confidence,
+      'rotationConfirmed': result.rotationConfirmed,
+      'corePoolSymbols': result.corePoolSymbols,
+      'selectedExperimentId': result.selectedExperimentId,
+      'selectedExperimentLabel': result.selectedExperimentLabel,
+      'actionable': _isLeaderPredictionActionable(result.regimeStatus),
+      'strongActionable': result.regimeStatus == 'recommend',
+      'status': 'pending',
       'settledAt': null,
       'actualLeader': null,
       'actualTop3': const <String>[],
@@ -2867,6 +3012,9 @@ class SignalRunnerService {
           ? null
           : returns[BinanceService.toSymbol(predictedTop1)];
       final medianReturn = _safeMedian(returns.values.toList());
+      final regimeStatus = record['regimeStatus']?.toString() ?? 'stand_aside';
+      final actionable = record['actionable'] == true ||
+          _isLeaderPredictionActionable(regimeStatus);
 
       record['actualLeader'] = actualLeader;
       record['actualTop3'] = actualTop3;
@@ -2875,11 +3023,8 @@ class SignalRunnerService {
       record['excessVsMedian'] =
           predictedReturn == null ? null : predictedReturn - medianReturn;
       record['settledAt'] = DateTime.now().toIso8601String();
-
-      if (status == 'suppressed') {
-        continue;
-      }
-
+      record['actionable'] = actionable;
+      record['strongActionable'] = regimeStatus == 'recommend';
       record['status'] = 'settled';
       record['top1Hit'] = predictedTop1 == actualLeader;
       record['top3Hit'] = predictedTop3.contains(actualLeader);
@@ -2892,14 +3037,26 @@ class SignalRunnerService {
     var settled = 0;
     var pending = 0;
     var suppressed = 0;
+    var recommend = 0;
+    var watchOnly = 0;
+    var actionable = 0;
     var wins = 0;
     var top3Wins = 0;
     var totalPredictedReturn = 0.0;
     var totalExcess = 0.0;
+    var actionableSettled = 0;
+    var actionableWins = 0;
+    var actionableTop3Wins = 0;
+    var actionableReturn = 0.0;
+    var recommendSettled = 0;
+    var recommendWins = 0;
+    var recommendTop3Wins = 0;
+    var recommendReturn = 0.0;
     DateTime? latestRecordedAt;
 
     for (final record in records) {
       final status = record['status']?.toString() ?? '';
+      final regimeStatus = record['regimeStatus']?.toString() ?? 'stand_aside';
       final recordedAt =
           DateTime.tryParse(record['recordedAt']?.toString() ?? '');
       if (recordedAt != null &&
@@ -2908,13 +3065,42 @@ class SignalRunnerService {
       }
 
       if (status == 'pending') pending += 1;
-      if (status == 'suppressed') suppressed += 1;
+      switch (regimeStatus) {
+        case 'recommend':
+          recommend += 1;
+          break;
+        case 'watch_only':
+          watchOnly += 1;
+          break;
+        default:
+          suppressed += 1;
+          break;
+      }
+      if (record['actionable'] == true ||
+          _isLeaderPredictionActionable(regimeStatus)) {
+        actionable += 1;
+      }
       if (status != 'settled') continue;
       settled += 1;
       if (record['top1Hit'] == true) wins += 1;
       if (record['top3Hit'] == true) top3Wins += 1;
       totalPredictedReturn += _asDouble(record['predictedCoinReturn']);
       totalExcess += _asDouble(record['excessVsMedian']);
+
+      final isActionable = record['actionable'] == true ||
+          _isLeaderPredictionActionable(regimeStatus);
+      if (isActionable) {
+        actionableSettled += 1;
+        if (record['top1Hit'] == true) actionableWins += 1;
+        if (record['top3Hit'] == true) actionableTop3Wins += 1;
+        actionableReturn += _asDouble(record['predictedCoinReturn']);
+      }
+      if (regimeStatus == 'recommend') {
+        recommendSettled += 1;
+        if (record['top1Hit'] == true) recommendWins += 1;
+        if (record['top3Hit'] == true) recommendTop3Wins += 1;
+        recommendReturn += _asDouble(record['predictedCoinReturn']);
+      }
     }
 
     return {
@@ -2922,13 +3108,37 @@ class SignalRunnerService {
       'pending': pending,
       'suppressed': suppressed,
       'settled': settled,
+      'recommend': recommend,
+      'watchOnly': watchOnly,
+      'actionable': actionable,
       'top1Wins': wins,
       'top3Wins': top3Wins,
       'top1HitRate': settled == 0 ? 0.0 : wins / settled,
       'top3HitRate': settled == 0 ? 0.0 : top3Wins / settled,
       'avgPredictedReturn': settled == 0 ? 0.0 : totalPredictedReturn / settled,
       'avgExcessVsMedian': settled == 0 ? 0.0 : totalExcess / settled,
+      'actionableTop1HitRate':
+          actionableSettled == 0 ? 0.0 : actionableWins / actionableSettled,
+      'actionableTop3HitRate':
+          actionableSettled == 0 ? 0.0 : actionableTop3Wins / actionableSettled,
+      'actionableAvgPredictedReturn':
+          actionableSettled == 0 ? 0.0 : actionableReturn / actionableSettled,
+      'recommendTop1HitRate':
+          recommendSettled == 0 ? 0.0 : recommendWins / recommendSettled,
+      'recommendTop3HitRate':
+          recommendSettled == 0 ? 0.0 : recommendTop3Wins / recommendSettled,
+      'recommendAvgPredictedReturn':
+          recommendSettled == 0 ? 0.0 : recommendReturn / recommendSettled,
       'latestRecordedAt': latestRecordedAt?.toIso8601String(),
+      'latestModelVersion':
+          records.isEmpty ? null : records.first['modelVersion'],
+      'latestConfidence': records.isEmpty ? null : records.first['confidence'],
+      'latestCorePoolSymbols':
+          records.isEmpty ? const <String>[] : records.first['corePoolSymbols'],
+      'latestSelectedExperimentId':
+          records.isEmpty ? null : records.first['selectedExperimentId'],
+      'latestSelectedExperimentLabel':
+          records.isEmpty ? null : records.first['selectedExperimentLabel'],
     };
   }
 
@@ -2944,13 +3154,22 @@ class SignalRunnerService {
           'windowDays': lookbackDays,
           'totalDays': 0,
           'recommendDays': 0,
+          'watchOnlyDays': 0,
+          'predictionDays': 0,
+          'actionableDays': 0,
           'suppressedDays': 0,
           'suppressRate': 0.0,
           'top1HitRate': 0.0,
           'top3HitRate': 0.0,
+          'actionableTop1HitRate': 0.0,
+          'actionableTop3HitRate': 0.0,
+          'recommendTop1HitRate': 0.0,
+          'recommendTop3HitRate': 0.0,
           'avgPredictedReturn': 0.0,
           'avgLeaderReturn': 0.0,
           'avgExcessVsMedian': 0.0,
+          'actionableAvgPredictedReturn': 0.0,
+          'recommendAvgPredictedReturn': 0.0,
           'recent20Top1HitRate': 0.0,
           'recent20Top3HitRate': 0.0,
           'longestMissStreak': 0,
@@ -2959,31 +3178,82 @@ class SignalRunnerService {
           'currentRegimeStatus': 'stand_aside',
         },
         'benchmarks': const <Map<String, dynamic>>[],
+        'experimentHistory': const <Map<String, dynamic>>[],
+        'bestExperiment': null,
+        'experimentSelectionPolicy': const <String, dynamic>{},
         'records': const <Map<String, dynamic>>[],
       };
     }
 
-    final symbolBars = <String, List<Kline>>{};
-    for (final entry in dailyHistory.entries) {
-      final normalized = BinanceService.toSymbol(entry.key);
-      final bars = _completeDailyBars(entry.value);
-      if (bars.length >= 31) {
-        symbolBars[normalized] = bars;
-      }
+    final scenarios = _buildLeaderBacktestScenarios(
+      dailyHistory: dailyHistory,
+      btcDailyHistory: btcBars,
+      lookbackDays: lookbackDays,
+    );
+    if (scenarios.isEmpty) {
+      return {
+        'summary': {
+          'windowDays': lookbackDays,
+          'totalDays': 0,
+          'recommendDays': 0,
+          'watchOnlyDays': 0,
+          'predictionDays': 0,
+          'actionableDays': 0,
+          'suppressedDays': 0,
+          'suppressRate': 0.0,
+          'top1HitRate': 0.0,
+          'top3HitRate': 0.0,
+          'actionableTop1HitRate': 0.0,
+          'actionableTop3HitRate': 0.0,
+          'recommendTop1HitRate': 0.0,
+          'recommendTop3HitRate': 0.0,
+          'avgPredictedReturn': 0.0,
+          'avgLeaderReturn': 0.0,
+          'avgExcessVsMedian': 0.0,
+          'actionableAvgPredictedReturn': 0.0,
+          'recommendAvgPredictedReturn': 0.0,
+          'recent20Top1HitRate': 0.0,
+          'recent20Top3HitRate': 0.0,
+          'longestMissStreak': 0,
+          'latestTop1': null,
+          'latestTop3': const <String>[],
+          'currentRegimeStatus': 'stand_aside',
+        },
+        'benchmarks': const <Map<String, dynamic>>[],
+        'experimentHistory': const <Map<String, dynamic>>[],
+        'bestExperiment': null,
+        'experimentSelectionPolicy': const <String, dynamic>{},
+        'records': const <Map<String, dynamic>>[],
+      };
     }
 
-    final btcDateSet = btcBars.map((item) => item.openTime).toSet();
-    final candidateDates = btcBars
-        .skip(30)
-        .take(max(0, btcBars.length - 31))
-        .map((item) => item.openTime)
-        .where(btcDateSet.contains)
-        .toList();
-    final selectedDates = candidateDates.length <= lookbackDays
-        ? candidateDates
-        : candidateDates.sublist(candidateDates.length - lookbackDays);
+    final recordsByExperiment = <String, List<Map<String, dynamic>>>{};
+    final experimentSummaries = <Map<String, dynamic>>[];
+    for (final config in LeaderPredictionService.experimentConfigs) {
+      final records = scenarios.map((scenario) {
+        final result = _leaderPrediction.analyze(
+          currentCoins: scenario.currentCoins,
+          dailyHistory: scenario.slicedHistory,
+          btcDailyHistory: scenario.btcSlice,
+          experimentConfig: config,
+        );
+        return _leaderModelRecord(
+          result: result,
+          scenario: scenario,
+        );
+      }).toList();
+      recordsByExperiment[config.id] = records;
+      experimentSummaries.add(
+        _summarizeLeaderExperimentConfig(config, records),
+      );
+    }
 
-    final modelRecords = <Map<String, dynamic>>[];
+    experimentSummaries.sort((a, b) => (_asDouble(b['selectionScore']))
+        .compareTo(_asDouble(a['selectionScore'])));
+    Map<String, dynamic>? bestExperiment = experimentSummaries.isEmpty
+        ? null
+        : Map<String, dynamic>.from(experimentSummaries.first);
+
     final baselineBuckets = <String, List<Map<String, dynamic>>>{
       'yesterday_leader_continue': [],
       'momentum_7d': [],
@@ -2992,16 +3262,156 @@ class SignalRunnerService {
     };
     String? previousActualLeader;
 
+    for (final scenario in scenarios) {
+      final sortedSymbols = scenario.actualReturns.keys.toList()..sort();
+      final randomSymbol = sortedSymbols.isEmpty
+          ? null
+          : sortedSymbols[scenario.currentDate % sortedSymbols.length]
+              .replaceAll('USDT', '');
+      baselineBuckets['yesterday_leader_continue']!.add(
+        _leaderBenchmarkRecord(
+          name: 'yesterday_leader_continue',
+          targetDate: scenario.nextDate,
+          predictedSymbol: previousActualLeader,
+          actualLeader: scenario.actualLeader,
+          actualTop3: scenario.actualTop3,
+          actualReturns: scenario.actualReturns,
+          medianReturn: scenario.medianReturn,
+        ),
+      );
+      baselineBuckets['momentum_7d']!.add(
+        _leaderBenchmarkRecord(
+          name: 'momentum_7d',
+          targetDate: scenario.nextDate,
+          predictedSymbol: _pickMomentumLeader(scenario.slicedHistory, 7),
+          actualLeader: scenario.actualLeader,
+          actualTop3: scenario.actualTop3,
+          actualReturns: scenario.actualReturns,
+          medianReturn: scenario.medianReturn,
+        ),
+      );
+      baselineBuckets['momentum_14d']!.add(
+        _leaderBenchmarkRecord(
+          name: 'momentum_14d',
+          targetDate: scenario.nextDate,
+          predictedSymbol: _pickMomentumLeader(scenario.slicedHistory, 14),
+          actualLeader: scenario.actualLeader,
+          actualTop3: scenario.actualTop3,
+          actualReturns: scenario.actualReturns,
+          medianReturn: scenario.medianReturn,
+        ),
+      );
+      baselineBuckets['random']!.add(
+        _leaderBenchmarkRecord(
+          name: 'random',
+          targetDate: scenario.nextDate,
+          predictedSymbol: randomSymbol,
+          actualLeader: scenario.actualLeader,
+          actualTop3: scenario.actualTop3,
+          actualReturns: scenario.actualReturns,
+          medianReturn: scenario.medianReturn,
+        ),
+      );
+
+      previousActualLeader = scenario.actualLeader;
+    }
+
+    final benchmarks = baselineBuckets.entries
+        .map((entry) => _summarizeLeaderBenchmark(entry.key, entry.value))
+        .toList();
+
+    var modelRecords = _selectLeaderExperimentRecords(
+      scenarios: scenarios,
+      recordsByExperiment: recordsByExperiment,
+    );
+    final fallbackBenchmark = _selectMomentumBenchmarkFallback(
+      bestExperiment: bestExperiment,
+      benchmarks: benchmarks,
+    );
+    if (fallbackBenchmark != null) {
+      final fallbackName =
+          fallbackBenchmark['name']?.toString() ?? 'momentum_7d';
+      final fallbackDays = fallbackName == 'momentum_14d' ? 14 : 7;
+      final fallbackId = 'fallback_$fallbackName';
+      final fallbackLabel =
+          fallbackDays == 14 ? 'Fallback Momentum 14d' : 'Fallback Momentum 7d';
+      bestExperiment = {
+        'round': 0,
+        'id': fallbackId,
+        'label': fallbackLabel,
+        'family': 'benchmark_fallback',
+        'corePoolSize': 0,
+        'selectionScore': _leaderExperimentSelectionScore(fallbackBenchmark),
+        'tradeableDays': fallbackBenchmark['totalDays'] ?? 0,
+        'corePoolSymbols': const <String>[],
+        ...fallbackBenchmark,
+      };
+      modelRecords = scenarios
+          .map((scenario) => _buildMomentumFallbackRecord(
+                scenario: scenario,
+                days: fallbackDays,
+                fallbackId: fallbackId,
+                fallbackLabel: fallbackLabel,
+              ))
+          .toList();
+    }
+
+    modelRecords.sort((a, b) => (a['targetCandleAt'] as String)
+        .compareTo(b['targetCandleAt'] as String));
+    final summary = _summarizeLeaderPredictionRecords(
+      modelRecords,
+      experimentHistory: experimentSummaries,
+      bestExperiment: bestExperiment,
+    );
+
+    return {
+      'summary': summary,
+      'benchmarks': benchmarks,
+      'experimentHistory': experimentSummaries,
+      'bestExperiment': bestExperiment,
+      'experimentSelectionPolicy': {
+        'mode': 'walk_forward_meta',
+        'trainingWindowDays': 30,
+        'minTrainingDays': 10,
+      },
+      'records': modelRecords,
+    };
+  }
+
+  List<_LeaderBacktestScenario> _buildLeaderBacktestScenarios({
+    required Map<String, List<Kline>> dailyHistory,
+    required List<Kline> btcDailyHistory,
+    required int lookbackDays,
+  }) {
+    final symbolBars = <String, List<Kline>>{};
+    for (final entry in dailyHistory.entries) {
+      final normalized = BinanceService.toSymbol(entry.key);
+      final bars = _completeDailyBars(entry.value);
+      if (bars.length >= 46) {
+        symbolBars[normalized] = bars;
+      }
+    }
+
+    final candidateDates = btcDailyHistory
+        .skip(45)
+        .take(max(0, btcDailyHistory.length - 46))
+        .map((item) => item.openTime)
+        .toList();
+    final selectedDates = candidateDates.length <= lookbackDays
+        ? candidateDates
+        : candidateDates.sublist(candidateDates.length - lookbackDays);
+    final scenarios = <_LeaderBacktestScenario>[];
+
     for (final currentDate in selectedDates) {
+      final nextDate = currentDate + const Duration(days: 1).inMilliseconds;
       final currentCoins = <CoinData>[];
       final slicedHistory = <String, List<Kline>>{};
       final actualReturns = <String, double>{};
-      final nextDate = currentDate + const Duration(days: 1).inMilliseconds;
 
       for (final entry in symbolBars.entries) {
         final bars = entry.value;
         final upto = _barsUpToDate(bars, currentDate);
-        if (upto.length < 30) continue;
+        if (upto.length < 45) continue;
 
         final currentBar = bars.firstWhere(
           (item) => item.openTime == currentDate,
@@ -3037,125 +3447,539 @@ class SignalRunnerService {
         }
       }
 
-      final btcSlice = _barsUpToDate(btcBars, currentDate);
-      if (currentCoins.length < 3 ||
-          btcSlice.length < 30 ||
-          actualReturns.isEmpty) {
+      final btcSlice = _barsUpToDate(btcDailyHistory, currentDate);
+      if (currentCoins.length < 4 ||
+          btcSlice.length < 45 ||
+          actualReturns.length < 4) {
         continue;
       }
 
-      final result = _leaderPrediction.analyze(
-        currentCoins: currentCoins,
-        dailyHistory: slicedHistory,
-        btcDailyHistory: btcSlice,
-      );
       final sortedActual = actualReturns.entries.toList()
         ..sort((a, b) => b.value.compareTo(a.value));
-      final actualLeader = sortedActual.first.key.replaceAll('USDT', '');
-      final actualTop3 = sortedActual
-          .take(3)
-          .map((item) => item.key.replaceAll('USDT', ''))
-          .toList();
-      final medianReturn = _safeMedian(actualReturns.values.toList());
-      final top1 = result.top3.isEmpty ? null : result.top3.first.displayName;
-      final top3 = result.top3.map((item) => item.displayName).toList();
-      final suppressed = result.regimeStatus != 'recommend';
-      final predictedReturn =
-          top1 == null ? null : actualReturns[BinanceService.toSymbol(top1)];
-
-      modelRecords.add({
-        'id': _leaderPredictionRecordId(
-          DateTime.fromMillisecondsSinceEpoch(nextDate, isUtc: true),
-        ),
-        'recordedAt':
-            DateTime.fromMillisecondsSinceEpoch(currentDate, isUtc: true)
-                .toIso8601String(),
-        'predictionWindow': 'next_binance_daily_candle',
-        'targetCandleAt':
-            DateTime.fromMillisecondsSinceEpoch(nextDate, isUtc: true)
-                .toIso8601String(),
-        'top1Symbol': top1,
-        'top3Symbols': top3,
-        'totalScore': result.top3.isEmpty ? 0.0 : result.top3.first.score,
-        'componentScores': _top1ComponentScoresFromResult(result.summary),
-        'regimeStatus': result.regimeStatus,
-        'status': suppressed ? 'suppressed' : 'settled',
-        'settledAt': DateTime.fromMillisecondsSinceEpoch(nextDate, isUtc: true)
-            .toIso8601String(),
-        'actualLeader': actualLeader,
-        'actualTop3': actualTop3,
-        'top1Hit': !suppressed && top1 == actualLeader,
-        'top3Hit': !suppressed && top3.contains(actualLeader),
-        'predictedCoinReturn': predictedReturn,
-        'leaderReturn': sortedActual.first.value,
-        'excessVsMedian':
-            predictedReturn == null ? null : predictedReturn - medianReturn,
-      });
-
-      final sortedSymbols = actualReturns.keys.toList()..sort();
-      final randomSymbol = sortedSymbols.isEmpty
-          ? null
-          : sortedSymbols[currentDate % sortedSymbols.length]
-              .replaceAll('USDT', '');
-      baselineBuckets['yesterday_leader_continue']!.add(
-        _leaderBenchmarkRecord(
-          name: 'yesterday_leader_continue',
-          targetDate: nextDate,
-          predictedSymbol: previousActualLeader,
-          actualLeader: actualLeader,
-          actualTop3: actualTop3,
+      scenarios.add(
+        _LeaderBacktestScenario(
+          currentDate: currentDate,
+          nextDate: nextDate,
+          currentCoins: currentCoins,
+          slicedHistory: slicedHistory,
+          btcSlice: btcSlice,
           actualReturns: actualReturns,
-          medianReturn: medianReturn,
+          actualLeader: sortedActual.first.key.replaceAll('USDT', ''),
+          actualTop3: sortedActual
+              .take(3)
+              .map((item) => item.key.replaceAll('USDT', ''))
+              .toList(),
+          medianReturn: _safeMedian(actualReturns.values.toList()),
+          leaderReturn: sortedActual.first.value,
         ),
       );
-      baselineBuckets['momentum_7d']!.add(
-        _leaderBenchmarkRecord(
-          name: 'momentum_7d',
-          targetDate: nextDate,
-          predictedSymbol: _pickMomentumLeader(slicedHistory, 7),
-          actualLeader: actualLeader,
-          actualTop3: actualTop3,
-          actualReturns: actualReturns,
-          medianReturn: medianReturn,
-        ),
-      );
-      baselineBuckets['momentum_14d']!.add(
-        _leaderBenchmarkRecord(
-          name: 'momentum_14d',
-          targetDate: nextDate,
-          predictedSymbol: _pickMomentumLeader(slicedHistory, 14),
-          actualLeader: actualLeader,
-          actualTop3: actualTop3,
-          actualReturns: actualReturns,
-          medianReturn: medianReturn,
-        ),
-      );
-      baselineBuckets['random']!.add(
-        _leaderBenchmarkRecord(
-          name: 'random',
-          targetDate: nextDate,
-          predictedSymbol: randomSymbol,
-          actualLeader: actualLeader,
-          actualTop3: actualTop3,
-          actualReturns: actualReturns,
-          medianReturn: medianReturn,
-        ),
-      );
-
-      previousActualLeader = actualLeader;
     }
 
-    modelRecords.sort((a, b) => (a['targetCandleAt'] as String)
-        .compareTo(b['targetCandleAt'] as String));
-    final summary = _summarizeLeaderPredictionRecords(modelRecords);
-    final benchmarks = baselineBuckets.entries
-        .map((entry) => _summarizeLeaderBenchmark(entry.key, entry.value))
-        .toList();
+    return scenarios;
+  }
 
+  Map<String, dynamic> _leaderModelRecord({
+    required LeaderPredictionResult result,
+    required _LeaderBacktestScenario scenario,
+  }) {
+    final top1 = result.top3.isEmpty ? null : result.top3.first.displayName;
+    final top3 = result.top3.map((item) => item.displayName).toList();
+    final predictedReturn = top1 == null
+        ? null
+        : scenario.actualReturns[BinanceService.toSymbol(top1)];
     return {
-      'summary': summary,
-      'benchmarks': benchmarks,
-      'records': modelRecords,
+      'id': _leaderPredictionRecordId(
+        DateTime.fromMillisecondsSinceEpoch(scenario.nextDate, isUtc: true),
+      ),
+      'recordedAt':
+          DateTime.fromMillisecondsSinceEpoch(scenario.currentDate, isUtc: true)
+              .toIso8601String(),
+      'predictionWindow': 'next_binance_daily_candle',
+      'targetCandleAt':
+          DateTime.fromMillisecondsSinceEpoch(scenario.nextDate, isUtc: true)
+              .toIso8601String(),
+      'signalType': 'leader_prediction',
+      'top1Symbol': top1,
+      'top3Symbols': top3,
+      'totalScore': result.top3.isEmpty ? 0.0 : result.top3.first.score,
+      'componentScores': _top1ComponentScoresFromResult(result.summary),
+      'regimeStatus': result.regimeStatus,
+      'regimeLabel': _leaderPredictionRegimeLabel(result.regimeStatus),
+      'regimeReason': result.regimeReason,
+      'modelVersion': result.modelVersion,
+      'confidence': result.confidence,
+      'rotationConfirmed': result.rotationConfirmed,
+      'corePoolSymbols': result.corePoolSymbols,
+      'selectedExperimentId': result.selectedExperimentId,
+      'selectedExperimentLabel': result.selectedExperimentLabel,
+      'actionable': _isLeaderPredictionActionable(result.regimeStatus),
+      'strongActionable': result.regimeStatus == 'recommend',
+      'status': 'settled',
+      'settledAt':
+          DateTime.fromMillisecondsSinceEpoch(scenario.nextDate, isUtc: true)
+              .toIso8601String(),
+      'actualLeader': scenario.actualLeader,
+      'actualTop3': scenario.actualTop3,
+      'top1Hit': top1 == scenario.actualLeader,
+      'top3Hit': top3.contains(scenario.actualLeader),
+      'predictedCoinReturn': predictedReturn,
+      'leaderReturn': scenario.leaderReturn,
+      'excessVsMedian': predictedReturn == null
+          ? null
+          : predictedReturn - scenario.medianReturn,
+    };
+  }
+
+  Map<String, dynamic> _buildMomentumFallbackRecord({
+    required _LeaderBacktestScenario scenario,
+    required int days,
+    required String fallbackId,
+    required String fallbackLabel,
+  }) {
+    final result = _buildMomentumFallbackLiveResult(
+      currentCoins: scenario.currentCoins,
+      dailyHistory: scenario.slicedHistory,
+      btcDailyHistory: scenario.btcSlice,
+      days: days,
+      fallbackId: fallbackId,
+      fallbackLabel: fallbackLabel,
+    );
+    return _leaderModelRecord(
+      result: result,
+      scenario: scenario,
+    );
+  }
+
+  LeaderPredictionResult _buildMomentumFallbackLiveResult({
+    required List<CoinData> currentCoins,
+    required Map<String, List<Kline>> dailyHistory,
+    required List<Kline> btcDailyHistory,
+    int days = 7,
+    String fallbackId = 'fallback_momentum_7d',
+    String fallbackLabel = 'Fallback Momentum 7d',
+  }) {
+    final generatedAt = DateTime.now();
+    final primaryMomentumLabel = '$days日动量';
+    final primaryKey = days == 14 ? 'ret14' : 'ret7';
+    final secondaryKey = days == 14 ? 'ret7' : 'ret14';
+    final normalizedHistory = <String, List<Kline>>{
+      for (final entry in dailyHistory.entries)
+        BinanceService.toSymbol(entry.key): _completeDailyBars(entry.value),
+    };
+    final candidates = <Map<String, dynamic>>[];
+
+    for (final coin in currentCoins) {
+      final symbol = BinanceService.toSymbol(coin.symbol);
+      final bars = normalizedHistory[symbol] ?? const <Kline>[];
+      if (bars.length < max(days + 1, 21)) continue;
+
+      final closes = bars.map((item) => item.close).toList();
+      final quotes = bars.map((item) => item.quoteVolume).toList();
+      final recent = bars.sublist(max(0, bars.length - 10));
+      final high10 = recent.map((item) => item.high).reduce(max);
+      final low10 = recent.map((item) => item.low).reduce(min);
+      final close = closes.last;
+      final sma10 = _averageDoubles(closes.sublist(max(0, closes.length - 10)));
+      final sma20 = _averageDoubles(closes.sublist(max(0, closes.length - 20)));
+      final volumeRatio = _averageDoubles(
+            quotes.sublist(max(0, quotes.length - 3)),
+          ) /
+          max(
+            _averageDoubles(quotes.sublist(max(0, quotes.length - 10))),
+            1,
+          );
+      final ret1 = _periodReturnFromBars(bars, 1);
+      final ret3 = _periodReturnFromBars(bars, 3);
+      final ret5 = _periodReturnFromBars(bars, 5);
+      final ret7 = _periodReturnFromBars(bars, 7);
+      final ret14 = _periodReturnFromBars(bars, 14);
+      final ret30 = _periodReturnFromBars(bars, 30);
+      final closeReturns = <double>[];
+      for (var index = 1; index < closes.length; index += 1) {
+        final previous = closes[index - 1];
+        if (previous <= 0) continue;
+        closeReturns.add(((closes[index] - previous) / previous) * 100);
+      }
+      final vol20 = _realizedVolatilityValues(
+        closeReturns.sublist(max(0, closeReturns.length - 20)),
+      );
+      final compressionRatio = vol20 <= 0
+          ? 1.0
+          : _realizedVolatilityValues(
+                  closeReturns.sublist(max(0, closeReturns.length - 5))) /
+              max(vol20, 0.0001);
+      final distanceToHigh10 =
+          high10 <= 0 ? 0.0 : ((close - high10) / high10) * 100;
+      final distanceToLow10 =
+          low10 <= 0 ? 0.0 : ((close - low10) / low10) * 100;
+      candidates.add({
+        'base': coin,
+        'symbol': coin.displayName,
+        'ret1': ret1,
+        'ret3': ret3,
+        'ret5': ret5,
+        'ret7': ret7,
+        'ret14': ret14,
+        'ret30': ret30,
+        'close': close,
+        'sma10': sma10,
+        'sma20': sma20,
+        'trend': close > sma10 && sma10 > sma20
+            ? 1.0
+            : (close > sma20 ? 0.68 : 0.28),
+        'volumeRatio': volumeRatio,
+        'volumeScore': (1 - ((volumeRatio - 1.2).abs() / 1.2)).clamp(0.0, 1.0),
+        'vol20': vol20,
+        'compressionRatio': compressionRatio,
+        'compression': (1 - (compressionRatio - 0.8).abs()).clamp(0.0, 1.0),
+        'distanceToHigh10': distanceToHigh10,
+        'distanceToLow10': distanceToLow10,
+        'heatPenalty': ret1 > 8 || ret3 > 15 ? 0.22 : 0.0,
+      });
+    }
+
+    if (candidates.isEmpty) {
+      return LeaderPredictionResult(
+        generatedAt: generatedAt,
+        rankedCoins: const <CoinData>[],
+        top3: const <CoinData>[],
+        regimeStatus: 'stand_aside',
+        regimeReason: '$primaryMomentumLabel回退模型当前没有足够的有效币种。',
+        marketBreadth: 0,
+        medianSevenDayReturn: 0,
+        btcDistanceToSma20: 0,
+        modelVersion:
+            '${LeaderPredictionService.modelVersion}+fallback_momentum$days',
+        confidence: 'low',
+        rotationConfirmed: false,
+        corePoolSymbols: const <String>[],
+        selectedExperimentId: fallbackId,
+        selectedExperimentLabel: fallbackLabel,
+        summary: const {
+          'mode': 'leader_prediction',
+          'top3Symbols': <String>[],
+          'top1ComponentScores': <String, double>{},
+        },
+      );
+    }
+
+    final byRet7 = [...candidates]
+      ..sort((a, b) => (_asDouble(b['ret7'])).compareTo(_asDouble(a['ret7'])));
+    final byRet14 = [
+      ...candidates
+    ]..sort((a, b) => (_asDouble(b['ret14'])).compareTo(_asDouble(a['ret14'])));
+    final byVol20 = [
+      ...candidates
+    ]..sort((a, b) => (_asDouble(a['vol20'])).compareTo(_asDouble(b['vol20'])));
+
+    final rank7 = _normalizedRankMap(byRet7);
+    final rank14 = _normalizedRankMap(byRet14);
+    final lowVolRank = _normalizedRankMap(byVol20);
+    final primaryRank = days == 14 ? rank14 : rank7;
+    final secondaryRank = days == 14 ? rank7 : rank14;
+
+    for (final candidate in candidates) {
+      final symbol = candidate['symbol']?.toString() ?? '';
+      final lowVol = lowVolRank[symbol] ?? 0.0;
+      final trend = _asDouble(candidate['trend']);
+      final volumeScore = _asDouble(candidate['volumeScore']);
+      final compression = _asDouble(candidate['compression']);
+      final heatPenalty = _asDouble(candidate['heatPenalty']);
+      final score = ((primaryRank[symbol] ?? 0.0) * 0.72) +
+          ((secondaryRank[symbol] ?? 0.0) * 0.16) +
+          (trend * 0.10) +
+          (volumeScore * 0.01) +
+          (lowVol * 0.02) +
+          (compression * 0.01) -
+          (heatPenalty * 0.5);
+      candidate['lowVol'] = lowVol;
+      candidate['rotation'] = primaryRank[symbol] ?? 0.0;
+      candidate['corePool'] = ((primaryRank[symbol] ?? 0.0) * 0.7) +
+          ((secondaryRank[symbol] ?? 0.0) * 0.3);
+      candidate['risk'] = (1 - heatPenalty).clamp(0.0, 1.0);
+      candidate['score'] = score.clamp(0.0, 1.0);
+    }
+
+    final sorted = [...candidates]..sort((a, b) {
+        final byPrimary =
+            _asDouble(b[primaryKey]).compareTo(_asDouble(a[primaryKey]));
+        if (byPrimary != 0) return byPrimary;
+        final bySecondary =
+            _asDouble(b[secondaryKey]).compareTo(_asDouble(a[secondaryKey]));
+        if (bySecondary != 0) return bySecondary;
+        return ((b['base'] as CoinData).quoteVolume)
+            .compareTo((a['base'] as CoinData).quoteVolume);
+      });
+    final topCandidates = sorted.take(3).toList();
+    final top1 = topCandidates.first;
+    final top2Score =
+        topCandidates.length >= 2 ? _asDouble(topCandidates[1]['score']) : 0.0;
+    final scoreGap = _asDouble(top1['score']) - top2Score;
+    final topCompression = _asDouble(top1['compression']);
+    final topTrend = _asDouble(top1['trend']);
+    final topRet14 = _asDouble(top1['ret14']);
+
+    final breadth = candidates.isEmpty
+        ? 0.0
+        : candidates.where((item) => _asDouble(item['ret7']) > 0).length /
+            candidates.length;
+    final medianSevenDayReturn =
+        _safeMedian(candidates.map((item) => _asDouble(item['ret7'])).toList());
+    final btcBars = _completeDailyBars(btcDailyHistory);
+    final btcClose = btcBars.isEmpty ? 0.0 : btcBars.last.close;
+    final btcSma20 = btcBars.length < 20
+        ? btcClose
+        : _averageDoubles(
+            btcBars
+                .sublist(max(0, btcBars.length - 20))
+                .map((item) => item.close)
+                .toList(),
+          );
+    final btcDistanceToSma20 =
+        btcSma20 <= 0 ? 0.0 : ((btcClose - btcSma20) / btcSma20) * 100;
+    final confidence =
+        scoreGap >= 0.12 ? 'high' : (scoreGap >= 0.05 ? 'medium' : 'low');
+    final strongMarket = btcDistanceToSma20 >= -1.0 && breadth >= 0.45;
+    final neutralMarket = btcDistanceToSma20 >= -2.5 && breadth >= 0.30;
+    final recommendSetup = topCompression >= 0.75 && topRet14 >= 18;
+    final watchSetup = topTrend >= 0.8 || topCompression >= 0.72;
+    final regimeStatus = strongMarket && recommendSetup
+        ? 'recommend'
+        : (neutralMarket && watchSetup ? 'watch_only' : 'stand_aside');
+    final regimeReason = regimeStatus == 'recommend'
+        ? '$primaryMomentumLabel基线当前优于轮动实验，且第一候选保留压缩结构，允许继续给出更克制的 Top1 出手信号。'
+        : (regimeStatus == 'watch_only'
+            ? '$primaryMomentumLabel基线领先，但当前只满足观察条件，继续等待更完整的压缩与确认。'
+            : '$primaryMomentumLabel基线虽可排序，但市场状态或结构质量不够，本轮只记录不出手。');
+
+    final rankedCoins = sorted.map((candidate) {
+      final base = candidate['base'] as CoinData;
+      final score = _asDouble(candidate['score']);
+      final symbol = candidate['symbol']?.toString() ?? base.displayName;
+      final recommendation = regimeStatus == 'recommend'
+          ? '可出手'
+          : (regimeStatus == 'watch_only' ? '轻仓观察' : '只做预测');
+      return CoinData(
+        symbol: base.symbol,
+        lastPrice: base.lastPrice,
+        priceChange: base.priceChange,
+        priceChangePercent: base.priceChangePercent,
+        highPrice: base.highPrice,
+        lowPrice: base.lowPrice,
+        openPrice: base.openPrice,
+        quoteVolume: base.quoteVolume,
+        volume: base.volume,
+        count: base.count,
+        score: score,
+        historicalScore: score,
+        entryScore: score,
+        expectedEdge: _asDouble(candidate['ret7']),
+        thirtyDayChange: _asDouble(candidate['ret30']),
+        sevenDayChange: _asDouble(candidate['ret7']),
+        daysSinceSurge: 0,
+        level: regimeStatus == 'recommend'
+            ? RecommendationLevel.buy
+            : RecommendationLevel.hold,
+        recommendation: recommendation,
+        reason:
+            '7日动量 ${_signedPercent(_asDouble(candidate['ret7']))}，14日 ${_signedPercent(_asDouble(candidate['ret14']))}，当前按$primaryMomentumLabel排序，量比 ${_asDouble(candidate['volumeRatio']).toStringAsFixed(2)}x。',
+        timingLabel: regimeStatus == 'recommend'
+            ? '$days日动量领先'
+            : (regimeStatus == 'watch_only' ? '候选观察' : '只记录'),
+        timingReason:
+            '$symbol 在 7d/14d 横截面动量中靠前，当前使用$primaryMomentumLabel基线回退模型进行排序。',
+      );
+    }).toList();
+
+    final corePoolSymbols = sorted
+        .take(min(6, sorted.length))
+        .map((item) => item['symbol']?.toString() ?? '')
+        .where((item) => item.isNotEmpty)
+        .toList();
+    final top3 = rankedCoins.take(3).toList();
+    final componentScores = <String, double>{
+      'rotation': _asDouble(top1['rotation']),
+      'trend': _asDouble(top1['trend']),
+      'compression': _asDouble(top1['compression']),
+      'volume': _asDouble(top1['volumeScore']),
+      'lowVol': _asDouble(top1['lowVol']),
+      'risk': _asDouble(top1['risk']),
+      'corePool': _asDouble(top1['corePool']),
+      'ret5': _asDouble(top1['ret5']),
+      'ret14': _asDouble(top1['ret14']),
+      'volumeRatio': _asDouble(top1['volumeRatio']),
+      'compressionRatio': _asDouble(top1['compressionRatio']),
+      'daysSinceLeader': 0.0,
+      'distanceToLow10': _asDouble(top1['distanceToLow10']),
+      'distanceToHigh10': _asDouble(top1['distanceToHigh10']),
+    };
+
+    return LeaderPredictionResult(
+      generatedAt: generatedAt,
+      rankedCoins: rankedCoins,
+      top3: top3,
+      regimeStatus: regimeStatus,
+      regimeReason: regimeReason,
+      marketBreadth: breadth,
+      medianSevenDayReturn: medianSevenDayReturn,
+      btcDistanceToSma20: btcDistanceToSma20,
+      modelVersion:
+          '${LeaderPredictionService.modelVersion}+fallback_momentum$days',
+      confidence: confidence,
+      rotationConfirmed: false,
+      corePoolSymbols: corePoolSymbols,
+      selectedExperimentId: fallbackId,
+      selectedExperimentLabel: fallbackLabel,
+      summary: {
+        'mode': 'leader_prediction',
+        'modelVersion':
+            '${LeaderPredictionService.modelVersion}+fallback_momentum$days',
+        'regimeStatus': regimeStatus,
+        'reason': regimeReason,
+        'confidence': confidence,
+        'marketBreadth': breadth,
+        'medianSevenDayReturn': medianSevenDayReturn,
+        'btcDistanceToSma20': btcDistanceToSma20,
+        'rotationConfirmed': false,
+        'corePoolSymbols': corePoolSymbols,
+        'selectedExperimentId': fallbackId,
+        'selectedExperimentLabel': fallbackLabel,
+        'top1Symbol': top3.isEmpty ? null : top3.first.displayName,
+        'top1Score': top3.isEmpty ? 0.0 : top3.first.score,
+        'top1ComponentScores': componentScores,
+        'top3Symbols': top3.map((item) => item.displayName).toList(),
+      },
+    );
+  }
+
+  Map<String, dynamic>? _selectMomentumBenchmarkFallback({
+    required Map<String, dynamic>? bestExperiment,
+    required List<Map<String, dynamic>> benchmarks,
+  }) {
+    final candidates = benchmarks
+        .where((item) =>
+            item['name'] == 'momentum_7d' || item['name'] == 'momentum_14d')
+        .toList();
+    if (candidates.isEmpty) return null;
+
+    candidates.sort((a, b) {
+      final byTop1 =
+          _asDouble(b['top1HitRate']).compareTo(_asDouble(a['top1HitRate']));
+      if (byTop1 != 0) return byTop1;
+      final byExcess = _asDouble(b['avgExcessVsMedian'])
+          .compareTo(_asDouble(a['avgExcessVsMedian']));
+      if (byExcess != 0) return byExcess;
+      return _asDouble(b['avgPredictedReturn'])
+          .compareTo(_asDouble(a['avgPredictedReturn']));
+    });
+
+    final bestBenchmark = candidates.first;
+    if (bestExperiment == null) return bestBenchmark;
+
+    final benchmarkTop1 = _asDouble(bestBenchmark['top1HitRate']);
+    final benchmarkReturn = _asDouble(bestBenchmark['avgPredictedReturn']);
+    final benchmarkExcess = _asDouble(bestBenchmark['avgExcessVsMedian']);
+    final experimentTop1 = _asDouble(bestExperiment['top1HitRate']);
+    final experimentReturn = _asDouble(bestExperiment['avgPredictedReturn']);
+    final experimentExcess = _asDouble(bestExperiment['avgExcessVsMedian']);
+
+    if (benchmarkTop1 > experimentTop1 + 0.015) return bestBenchmark;
+    if ((benchmarkTop1 - experimentTop1).abs() <= 0.015 &&
+        benchmarkExcess > experimentExcess + 0.12) {
+      return bestBenchmark;
+    }
+    if ((benchmarkTop1 - experimentTop1).abs() <= 0.005 &&
+        benchmarkReturn > experimentReturn + 0.15) {
+      return bestBenchmark;
+    }
+    return null;
+  }
+
+  int _fallbackMomentumDays(Map<String, dynamic>? bestExperiment) {
+    final name = bestExperiment?['name']?.toString() ?? '';
+    if (name == 'momentum_14d') return 14;
+    return 7;
+  }
+
+  List<Map<String, dynamic>> _selectLeaderExperimentRecords({
+    required List<_LeaderBacktestScenario> scenarios,
+    required Map<String, List<Map<String, dynamic>>> recordsByExperiment,
+  }) {
+    final modelRecords = <Map<String, dynamic>>[];
+    for (var index = 0; index < scenarios.length; index += 1) {
+      final chosenConfig = _chooseLeaderExperimentConfig(
+        index: index,
+        recordsByExperiment: recordsByExperiment,
+      );
+      final source = Map<String, dynamic>.from(
+          recordsByExperiment[chosenConfig.id]![index]);
+      source['selectedByMeta'] = true;
+      modelRecords.add(source);
+    }
+    return modelRecords;
+  }
+
+  LeaderPredictionExperimentConfig _chooseLeaderExperimentConfig({
+    required int index,
+    required Map<String, List<Map<String, dynamic>>> recordsByExperiment,
+  }) {
+    if (index < 10) {
+      return LeaderPredictionService.defaultExperimentConfig;
+    }
+
+    LeaderPredictionExperimentConfig? bestConfig;
+    double? bestScore;
+    for (final config in LeaderPredictionService.experimentConfigs) {
+      final allRecords = recordsByExperiment[config.id] ?? const [];
+      if (allRecords.isEmpty) continue;
+      final upper = min(index, allRecords.length);
+      final start = max(0, upper - 30);
+      final training = allRecords.sublist(start, upper);
+      if (training.length < 10) continue;
+      final score = _leaderExperimentSelectionScore(
+        _summarizeLeaderPredictionRecords(training),
+      );
+      if (bestScore == null || score > bestScore) {
+        bestScore = score;
+        bestConfig = config;
+      }
+    }
+
+    return bestConfig ?? LeaderPredictionService.defaultExperimentConfig;
+  }
+
+  double _leaderExperimentSelectionScore(Map<String, dynamic> summary) {
+    final top1 = _asDouble(summary['top1HitRate']);
+    final recent20 = _asDouble(summary['recent20Top1HitRate']);
+    final avgReturn = _asDouble(summary['avgPredictedReturn']);
+    final avgExcess = _asDouble(summary['avgExcessVsMedian']);
+    final missPenalty = (_asDouble(summary['longestMissStreak']) /
+            max(1, _asDouble(summary['totalDays'])))
+        .clamp(0.0, 1.0);
+    return (top1 * 0.58) +
+        (recent20 * 0.22) +
+        (_normalize(avgExcess, -2.0, 2.5) * 0.12) +
+        (_normalize(avgReturn, -2.0, 2.5) * 0.08) -
+        (missPenalty * 0.10);
+  }
+
+  Map<String, dynamic> _summarizeLeaderExperimentConfig(
+    LeaderPredictionExperimentConfig config,
+    List<Map<String, dynamic>> records,
+  ) {
+    final summary = _summarizeLeaderPredictionRecords(records);
+    return {
+      'round': config.round,
+      'id': config.id,
+      'label': config.label,
+      'family': config.family,
+      'corePoolSize': config.corePoolSize,
+      'selectionScore': _leaderExperimentSelectionScore(summary),
+      'tradeableDays': summary['predictionDays'] ?? 0,
+      'corePoolSymbols': records.isEmpty
+          ? const <String>[]
+          : _asStringList(records.last['corePoolSymbols']),
+      ...summary,
     };
   }
 
@@ -3190,12 +4014,29 @@ class SignalRunnerService {
   }
 
   Map<String, dynamic> _summarizeLeaderPredictionRecords(
-    List<Map<String, dynamic>> records,
-  ) {
+    List<Map<String, dynamic>> records, {
+    List<Map<String, dynamic>> experimentHistory = const [],
+    Map<String, dynamic>? bestExperiment,
+  }) {
     final settled = records
         .where((record) => record['status']?.toString() == 'settled')
         .toList();
-    final suppressed = records.length - settled.length;
+    final recommendRecords = settled
+        .where((record) => record['regimeStatus']?.toString() == 'recommend')
+        .toList();
+    final watchOnlyRecords = settled
+        .where((record) => record['regimeStatus']?.toString() == 'watch_only')
+        .toList();
+    final suppressed = records
+        .where((record) => record['regimeStatus']?.toString() == 'stand_aside')
+        .length;
+    final actionableRecords = settled
+        .where((record) =>
+            record['actionable'] == true ||
+            _isLeaderPredictionActionable(
+              record['regimeStatus']?.toString() ?? 'stand_aside',
+            ))
+        .toList();
     final recent20 =
         settled.length <= 20 ? settled : settled.sublist(settled.length - 20);
 
@@ -3204,6 +4045,12 @@ class SignalRunnerService {
     var totalPredictedReturn = 0.0;
     var totalLeaderReturn = 0.0;
     var totalExcess = 0.0;
+    var actionableTop1Hits = 0;
+    var actionableTop3Hits = 0;
+    var actionableReturn = 0.0;
+    var recommendTop1Hits = 0;
+    var recommendTop3Hits = 0;
+    var recommendReturn = 0.0;
     var missStreak = 0;
     var longestMissStreak = 0;
 
@@ -3225,6 +4072,18 @@ class SignalRunnerService {
       totalExcess += _asDouble(record['excessVsMedian']);
     }
 
+    for (final record in actionableRecords) {
+      if (record['top1Hit'] == true) actionableTop1Hits += 1;
+      if (record['top3Hit'] == true) actionableTop3Hits += 1;
+      actionableReturn += _asDouble(record['predictedCoinReturn']);
+    }
+
+    for (final record in recommendRecords) {
+      if (record['top1Hit'] == true) recommendTop1Hits += 1;
+      if (record['top3Hit'] == true) recommendTop3Hits += 1;
+      recommendReturn += _asDouble(record['predictedCoinReturn']);
+    }
+
     var recent20Top1Hits = 0;
     var recent20Top3Hits = 0;
     for (final record in recent20) {
@@ -3236,16 +4095,37 @@ class SignalRunnerService {
     return {
       'windowDays': records.length,
       'totalDays': records.length,
-      'recommendDays': settled.length,
+      'predictionDays': settled.length,
+      'recommendDays': recommendRecords.length,
+      'watchOnlyDays': watchOnlyRecords.length,
+      'actionableDays': actionableRecords.length,
       'suppressedDays': suppressed,
       'suppressRate': records.isEmpty ? 0.0 : suppressed / records.length,
       'top1HitRate': settled.isEmpty ? 0.0 : top1Hits / settled.length,
       'top3HitRate': settled.isEmpty ? 0.0 : top3Hits / settled.length,
+      'actionableTop1HitRate': actionableRecords.isEmpty
+          ? 0.0
+          : actionableTop1Hits / actionableRecords.length,
+      'actionableTop3HitRate': actionableRecords.isEmpty
+          ? 0.0
+          : actionableTop3Hits / actionableRecords.length,
+      'recommendTop1HitRate': recommendRecords.isEmpty
+          ? 0.0
+          : recommendTop1Hits / recommendRecords.length,
+      'recommendTop3HitRate': recommendRecords.isEmpty
+          ? 0.0
+          : recommendTop3Hits / recommendRecords.length,
       'avgPredictedReturn':
           settled.isEmpty ? 0.0 : totalPredictedReturn / settled.length,
       'avgLeaderReturn':
           settled.isEmpty ? 0.0 : totalLeaderReturn / settled.length,
       'avgExcessVsMedian': settled.isEmpty ? 0.0 : totalExcess / settled.length,
+      'actionableAvgPredictedReturn': actionableRecords.isEmpty
+          ? 0.0
+          : actionableReturn / actionableRecords.length,
+      'recommendAvgPredictedReturn': recommendRecords.isEmpty
+          ? 0.0
+          : recommendReturn / recommendRecords.length,
       'recent20Top1HitRate':
           recent20.isEmpty ? 0.0 : recent20Top1Hits / recent20.length,
       'recent20Top3HitRate':
@@ -3254,6 +4134,14 @@ class SignalRunnerService {
       'latestTop1': latest?['top1Symbol'],
       'latestTop3': latest?['top3Symbols'] ?? const <String>[],
       'currentRegimeStatus': latest?['regimeStatus'] ?? 'stand_aside',
+      'currentModelVersion': latest?['modelVersion'],
+      'currentConfidence': latest?['confidence'],
+      'currentCorePoolSymbols': latest?['corePoolSymbols'] ?? const <String>[],
+      'selectedExperimentId': latest?['selectedExperimentId'],
+      'selectedExperimentLabel': latest?['selectedExperimentLabel'],
+      'bestExperimentId': bestExperiment?['id'],
+      'bestExperimentLabel': bestExperiment?['label'],
+      'experimentCount': experimentHistory.length,
     };
   }
 
@@ -3277,9 +4165,22 @@ class SignalRunnerService {
     var totalPredictedReturn = 0.0;
     var totalExcess = 0.0;
     var validPredictions = 0;
+    var missStreak = 0;
+    var longestMissStreak = 0;
+    final recent20 =
+        records.length <= 20 ? records : records.sublist(records.length - 20);
+    var recent20Top1Hits = 0;
 
     for (final record in records) {
-      if (record['top1Hit'] == true) top1Hits += 1;
+      if (record['top1Hit'] == true) {
+        top1Hits += 1;
+        missStreak = 0;
+      } else {
+        missStreak += 1;
+        if (missStreak > longestMissStreak) {
+          longestMissStreak = missStreak;
+        }
+      }
       if (record['top3Hit'] == true) top3Hits += 1;
       final predictedReturn = record['predictedReturn'];
       if (predictedReturn != null) {
@@ -3288,12 +4189,18 @@ class SignalRunnerService {
         totalExcess += _asDouble(record['excessVsMedian']);
       }
     }
+    for (final record in recent20) {
+      if (record['top1Hit'] == true) recent20Top1Hits += 1;
+    }
 
     return {
       'name': name,
       'totalDays': records.length,
       'top1HitRate': top1Hits / records.length,
       'top3HitRate': top3Hits / records.length,
+      'recent20Top1HitRate':
+          recent20.isEmpty ? 0.0 : recent20Top1Hits / recent20.length,
+      'longestMissStreak': longestMissStreak,
       'avgPredictedReturn':
           validPredictions == 0 ? 0.0 : totalPredictedReturn / validPredictions,
       'avgExcessVsMedian':
@@ -3369,6 +4276,43 @@ class SignalRunnerService {
     final mid = sorted.length ~/ 2;
     if (sorted.length.isOdd) return sorted[mid];
     return (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+
+  double _averageDoubles(List<double> values) {
+    if (values.isEmpty) return 0.0;
+    return values.reduce((a, b) => a + b) / values.length;
+  }
+
+  double _realizedVolatilityValues(List<double> values) {
+    if (values.length < 2) return 0.0;
+    final mean = _averageDoubles(values);
+    var total = 0.0;
+    for (final value in values) {
+      final delta = value - mean;
+      total += delta * delta;
+    }
+    return sqrt(total / values.length);
+  }
+
+  Map<String, double> _normalizedRankMap(List<Map<String, dynamic>> ordered) {
+    if (ordered.isEmpty) return const <String, double>{};
+    if (ordered.length == 1) {
+      final only = ordered.first['symbol']?.toString() ?? '';
+      return only.isEmpty ? const <String, double>{} : {only: 1.0};
+    }
+
+    final map = <String, double>{};
+    final denominator = max(1, ordered.length - 1).toDouble();
+    for (var index = 0; index < ordered.length; index += 1) {
+      final symbol = ordered[index]['symbol']?.toString() ?? '';
+      if (symbol.isEmpty) continue;
+      map[symbol] = (ordered.length - 1 - index) / denominator;
+    }
+    return map;
+  }
+
+  String _signedPercent(double value) {
+    return '${value >= 0 ? '+' : ''}${value.toStringAsFixed(1)}%';
   }
 
   DateTime _leaderPredictionTargetDate(DateTime recordedAt) {
@@ -3541,6 +4485,11 @@ class SignalRunnerService {
     if (value is num) return value.toDouble();
     if (value == null) return 0.0;
     return double.tryParse(value.toString()) ?? 0.0;
+  }
+
+  double _normalize(double value, double minValue, double maxValue) {
+    if (maxValue <= minValue) return 0.0;
+    return ((value - minValue) / (maxValue - minValue)).clamp(0.0, 1.0);
   }
 
   Map<String, dynamic>? _asJsonMap(dynamic value) {
@@ -3846,5 +4795,31 @@ class _StartupStageSelection {
     required this.observationCandidates,
     required this.observationSuppressedCount,
     required this.awaitingObservationConfirmationCount,
+  });
+}
+
+class _LeaderBacktestScenario {
+  final int currentDate;
+  final int nextDate;
+  final List<CoinData> currentCoins;
+  final Map<String, List<Kline>> slicedHistory;
+  final List<Kline> btcSlice;
+  final Map<String, double> actualReturns;
+  final String actualLeader;
+  final List<String> actualTop3;
+  final double medianReturn;
+  final double leaderReturn;
+
+  const _LeaderBacktestScenario({
+    required this.currentDate,
+    required this.nextDate,
+    required this.currentCoins,
+    required this.slicedHistory,
+    required this.btcSlice,
+    required this.actualReturns,
+    required this.actualLeader,
+    required this.actualTop3,
+    required this.medianReturn,
+    required this.leaderReturn,
   });
 }

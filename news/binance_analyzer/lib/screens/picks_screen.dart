@@ -23,7 +23,7 @@ typedef SignalActionSubmittingResolver = bool Function(
   String signalType,
 );
 
-/// 下一根日线领涨预测 —— 首页 Tab
+/// 明日轮动 Top1 —— 首页 Tab
 class PicksScreen extends StatelessWidget {
   final MarketState state;
   final Future<void> Function({bool silent}) onRefresh;
@@ -106,12 +106,12 @@ class PicksScreen extends StatelessWidget {
           const Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('领涨预测',
+              Text('轮动 Top1',
                   style: TextStyle(
                       color: AppTheme.textPrimary,
                       fontSize: 18,
                       fontWeight: FontWeight.bold)),
-              Text('下一根币安日线 · Top3 候选',
+              Text('下一根币安日线 · 明日轮动预测',
                   style:
                       TextStyle(color: AppTheme.textSecondary, fontSize: 11)),
             ],
@@ -393,7 +393,7 @@ class PicksScreen extends StatelessWidget {
                       color: AppTheme.binanceYellow,
                       borderRadius: BorderRadius.circular(2))),
               const SizedBox(width: 8),
-              const Text('下一根日线领涨预测',
+              const Text('明日轮动预测',
                   style: TextStyle(
                       color: AppTheme.textPrimary,
                       fontSize: 17,
@@ -483,15 +483,15 @@ class PicksScreen extends StatelessWidget {
         child: const Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('📊 领涨模型说明',
+            Text('📊 轮动 Top1 模型说明',
                 style: TextStyle(
                     color: AppTheme.textPrimary,
                     fontSize: 13,
                     fontWeight: FontWeight.bold)),
             SizedBox(height: 8),
-            _AlgoRow('相对动量 (35%)', '比较 7d / 14d / 21d 强弱，14d 权重最高'),
-            _AlgoRow('趋势确认 (20%)', '优先 close > SMA10 > SMA20 的顺势结构'),
-            _AlgoRow('低波动 + 量能', '低波动更优，3d/10d 量比处于健康区间更加分'),
+            _AlgoRow('轮动冷却', '优先挑选距上次领涨已有几天、但仍在核心轮动池内的币'),
+            _AlgoRow('短趋势 + 压缩', '不追当天最强，优先温和转强且波动压缩的结构'),
+            _AlgoRow('量能 + 风控', '3d/10d 量比健康、不过热、BTC 不明显走弱时才更可信'),
           ],
         ),
       ),

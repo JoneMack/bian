@@ -58,6 +58,48 @@ class BinanceService {
     'id',
   ];
 
+  // 轮动 Top1 预测默认只使用更稳定的核心观察池。
+  static const List<String> leaderPredictionCoreRaw = [
+    'stg',
+    'ton',
+    'avax',
+    'link',
+    'api3',
+    'stx',
+    'apt',
+    'fet',
+    'lqty',
+    'ldo',
+    'ssv',
+    'op',
+    'mana',
+  ];
+
+  // 高波动题材池保留给观察和人工干预，不作为默认领涨预测池。
+  static const List<String> leaderPredictionHighVolatilityRaw = [
+    'phb',
+    'og',
+    'ark',
+    'nfp',
+    'high',
+    'gala',
+    'neiro',
+    'icx',
+    'bome',
+    'chr',
+    'mask',
+    'magic',
+    'hft',
+    'mdt',
+    'id',
+  ];
+
+  // 事件风险过高，默认不参与领涨预测。
+  static const List<String> leaderPredictionExcludedRaw = [
+    'luna',
+    'ftt',
+  ];
+
   static const List<String> _symbolBlacklistKeywords = [
     'UPUSDT',
     'DOWNUSDT',
@@ -74,6 +116,15 @@ class BinanceService {
       defaultWatchlistRaw.map(toSymbol).toList();
 
   static List<String> get defaultWatchlistSymbols => watchlistSymbols;
+
+  static List<String> get defaultLeaderPredictionSymbols =>
+      leaderPredictionCoreRaw.map(toSymbol).toList();
+
+  static List<String> get highVolatilityWatchlistSymbols =>
+      leaderPredictionHighVolatilityRaw.map(toSymbol).toList();
+
+  static List<String> get excludedLeaderPredictionSymbols =>
+      leaderPredictionExcludedRaw.map(toSymbol).toList();
 
   // ── 主入口 ──────────────────────────────────────────────
   Future<List<CoinData>> fetchTickers({

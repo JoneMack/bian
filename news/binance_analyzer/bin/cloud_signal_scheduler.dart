@@ -805,6 +805,27 @@ class _CloudSignalSchedulerApp {
       'leaderPredictionUpdatedAt': _latestPredictionLog?['updatedAt'],
       'leaderPredictionRegime': _latestReport?['regimeStatus'] ??
           (_latestReport?['summary'] as Map?)?['regimeStatus'],
+      'leaderPredictionRotationConfirmed':
+          (_latestReport?['summary'] as Map?)?['rotationConfirmed'] ??
+              (_latestPredictionLog?['summary'] as Map?)?['rotationConfirmed'],
+      'leaderPredictionConfidence': _latestReport?['confidence'] ??
+          (_latestReport?['summary'] as Map?)?['confidence'] ??
+          (_latestPredictionLog?['summary'] as Map?)?['currentConfidence'],
+      'leaderPredictionCorePoolSymbols':
+          _latestReport?['corePoolSymbols'] ??
+              (_latestReport?['summary'] as Map?)?['corePoolSymbols'] ??
+              (_latestPredictionLog?['summary'] as Map?)?['currentCorePoolSymbols'],
+      'leaderPredictionModelVersion': _latestReport?['modelVersion'] ??
+          (_latestReport?['summary'] as Map?)?['modelVersion'] ??
+          (_latestPredictionLog?['summary'] as Map?)?['currentModelVersion'],
+      'leaderPredictionSelectedExperimentId':
+          _latestReport?['selectedExperimentId'] ??
+              (_latestReport?['summary'] as Map?)?['selectedExperimentId'] ??
+              (_latestPredictionLog?['summary'] as Map?)?['selectedExperimentId'],
+      'leaderPredictionSelectedExperimentLabel':
+          _latestReport?['selectedExperimentLabel'] ??
+              (_latestReport?['summary'] as Map?)?['selectedExperimentLabel'] ??
+              (_latestPredictionLog?['summary'] as Map?)?['selectedExperimentLabel'],
       'leaderPredictionTop1': (_latestReport?['top1'] as Map?)?['symbol'] ??
           (_latestReport?['summary'] as Map?)?['top1Symbol'],
       'leaderPredictionTop3': leaderTop3,

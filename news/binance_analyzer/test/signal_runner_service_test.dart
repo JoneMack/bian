@@ -488,7 +488,7 @@ void main() {
       final payload = jsonDecode(request.body) as Map<String, dynamic>;
       final text =
           (payload['content'] as Map<String, dynamic>)['text'] as String;
-      expect(text, contains('下一根日线领涨预测'));
+      expect(text, contains('明日轮动 Top1 预测'));
       expect(text, contains('Top1: FET'));
       expect(text, contains('Top3: FET, LINK, TON'));
       return http.Response('{"code":0,"msg":"success"}', 200);
@@ -518,7 +518,7 @@ void main() {
     final bars = _buildSampleBars(
       start: DateTime.utc(2026, 1, 1),
       closes: [
-        for (var i = 0; i < 33; i += 1) 1.00 + i * 0.01,
+        for (var i = 0; i < 57; i += 1) 1.00 + i * 0.01,
         1.60,
         1.68,
         1.75,
@@ -527,13 +527,13 @@ void main() {
     final weakerBars = _buildSampleBars(
       start: DateTime.utc(2026, 1, 1),
       closes: [
-        for (var i = 0; i < 36; i += 1) 1.00 + i * 0.003,
+        for (var i = 0; i < 60; i += 1) 1.00 + i * 0.003,
       ],
     );
     final btcBars = _buildSampleBars(
       start: DateTime.utc(2026, 1, 1),
       closes: [
-        for (var i = 0; i < 36; i += 1) 80000 + i * 120,
+        for (var i = 0; i < 60; i += 1) 80000 + i * 120,
       ],
     );
     final targetDate = DateTime.fromMillisecondsSinceEpoch(
@@ -570,6 +570,7 @@ void main() {
         'FETUSDT': bars,
         'LINKUSDT': weakerBars,
         'TONUSDT': weakerBars,
+        'STGUSDT': weakerBars,
       },
       btcDailyHistory: btcBars,
       lookbackDays: 10,
@@ -1004,9 +1005,9 @@ LeaderPredictionResult _leaderPredictionFixture() {
     score: 0.82,
     historicalScore: 0.88,
     entryScore: 0.81,
-    recommendation: '可推荐',
-    reason: '动量 88 | 趋势 81 | 低波动 72 | 量能 79',
-    timingLabel: '下一根日线领涨预测',
+    recommendation: '可出手',
+    reason: '3日回撤 -4.2% | 靠近10日低位 2.1% | 低波动 72',
+    timingLabel: '次日收益候选',
     timingReason: '14d +12.3% · 7d +5.6% · 量比 1.24x',
   );
 
@@ -1022,8 +1023,8 @@ LeaderPredictionResult _leaderPredictionFixture() {
     volume: 6000000,
     count: 3200,
     score: 0.76,
-    recommendation: '可推荐',
-    timingLabel: '下一根日线领涨预测',
+    recommendation: '可出手',
+    timingLabel: '次日收益候选',
   );
 
   final third = CoinData(
@@ -1038,8 +1039,8 @@ LeaderPredictionResult _leaderPredictionFixture() {
     volume: 5000000,
     count: 2800,
     score: 0.71,
-    recommendation: '可推荐',
-    timingLabel: '下一根日线领涨预测',
+    recommendation: '可出手',
+    timingLabel: '次日收益候选',
   );
 
   return LeaderPredictionResult(
@@ -1047,23 +1048,37 @@ LeaderPredictionResult _leaderPredictionFixture() {
     rankedCoins: [coin, second, third],
     top3: [coin, second, third],
     regimeStatus: 'recommend',
-    regimeReason: '市场状态配合，允许输出下一根日线领涨预测。',
+    regimeReason: '市场广度尚可，BTC 没有明显走弱，可执行轮动 Top1 预测。 当前第一候选优势清晰，可发送 Top1 轮动预测。',
     marketBreadth: 0.62,
     medianSevenDayReturn: 4.2,
     btcDistanceToSma20: 1.8,
+    modelVersion: LeaderPredictionService.modelVersion,
+    confidence: 'high',
+    rotationConfirmed: true,
+    corePoolSymbols: const ['FET', 'LINK', 'TON', 'STG', 'OG', 'APT'],
+    selectedExperimentId: 'cooldown_pool6',
+    selectedExperimentLabel: 'Cooldown Re-entry / Pool 6',
     summary: {
       'mode': 'leader_prediction',
+      'modelVersion': LeaderPredictionService.modelVersion,
       'regimeStatus': 'recommend',
+      'confidence': 'high',
       'top1Symbol': 'FET',
       'top3Symbols': ['FET', 'LINK', 'TON'],
       'top1ComponentScores': {
-        'momentum': 0.88,
+        'rotation': 0.88,
         'trend': 0.81,
+        'compression': 0.74,
+        'volume': 0.79,
         'lowVol': 0.72,
-        'volumeHealth': 0.79,
+        'risk': 0.84,
+        'corePool': 0.83,
+        'ret5': 1.8,
         'ret14': 12.3,
-        'ret7': 5.6,
         'volumeRatio': 1.24,
+        'compressionRatio': 0.78,
+        'daysSinceLeader': 6.0,
+        'distanceToLow10': 2.1,
         'distanceToHigh10': -1.4,
       },
     },

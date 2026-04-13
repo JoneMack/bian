@@ -142,10 +142,10 @@ void main() {
       ),
     );
 
-    expect(find.text('领涨预测'), findsOneWidget);
-    expect(find.text('下一根币安日线 · Top3 候选'), findsOneWidget);
+    expect(find.text('轮动 Top1'), findsOneWidget);
+    expect(find.text('下一根币安日线 · 明日轮动预测'), findsOneWidget);
     expect(find.text('飞书信号待处理'), findsOneWidget);
-    expect(find.text('下一根日线领涨预测'), findsOneWidget);
+    expect(find.text('明日轮动预测'), findsOneWidget);
     expect(find.text('FET'), findsWidgets);
     expect(find.text('确定'), findsOneWidget);
     expect(find.text('取消'), findsWidgets);
