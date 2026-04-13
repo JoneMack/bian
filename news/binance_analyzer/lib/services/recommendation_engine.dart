@@ -2,6 +2,7 @@ import 'dart:math';
 
 import '../models/coin_data.dart';
 import '../models/strategy_snapshot.dart';
+import '../utils/technical_indicators.dart';
 import 'binance_service.dart';
 
 class RecommendationEngineResult {
@@ -399,28 +400,89 @@ class RecommendationEngine {
               .clamp(0.0, 1.0);
 
       final trigger =
-          (_sweetSpot(profile.triggerChangePercent, 2.2, 3.6) * 0.45 +
-                  _sweetSpot(profile.triggerRangePosition, 0.35, 0.35) * 0.25 +
-                  _clamp01((profile.turnStrength + 0.04) / 0.10) * 0.30)
+          (_sweetSpot(profile.triggerChangePercent, 2.2, 3.6) * 0.35 +
+                  _sweetSpot(profile.triggerRangePosition, 0.35, 0.35) * 0.20 +
+                  _clamp01((profile.turnStrength + 0.04) / 0.10) * 0.20 +
+                  // 新增：MACD 金叉加分
+                  (profile.macdCrossover ? 1.0 : _clamp01((profile.macdHistogram + 0.01) / 0.03)) * 0.25)
               .clamp(0.0, 1.0);
 
       final liquidity =
-          (quoteVolumeRank[key]! * 0.70 + tradeCountRank[key]! * 0.30)
+          (quoteVolumeRank[key]! * 0.55 +
+                  tradeCountRank[key]! * 0.20 +
+                  // 新增：OBV 量能趋势
+                  profile.obvTrend * 0.25)
               .clamp(0.0, 1.0);
+
+      // 新增：技术指标综合分
+      // RSI 评分：超卖区 (30-45) 最佳买入，超买 (>70) 惩罚
+      double rsiScore;
+      if (profile.rsi14 <= 30) {
+        rsiScore = 0.85;
+      } else if (profile.rsi14 <= 45) {
+        rsiScore = 0.85 + (profile.rsi14 - 30) / 15 * 0.15;
+      } else if (profile.rsi14 <= 55) {
+        rsiScore = 0.70;
+      } else if (profile.rsi14 <= 70) {
+        rsiScore = 0.70 - (profile.rsi14 - 55) / 15 * 0.30;
+      } else {
+        rsiScore = max(0.10, 0.40 - (profile.rsi14 - 70) / 30 * 0.30);
+      }
+
+      // 布林带评分：接近下轨 + 带宽收窄 = 蓄势
+      double bbScore = (1.0 - profile.bollingerPercentB).clamp(0.0, 1.0) * 0.6 +
+          (profile.bollingerBandwidth < 0.04 ? 0.4 : profile.bollingerBandwidth < 0.08 ? 0.2 : 0.0);
+      bbScore = bbScore.clamp(0.0, 1.0);
+
+      // ADX 趋势强度：强趋势 + 向上趋势 → 加分
+      final adxScore = profile.adx14 > 25 && profile.emaTrendScore >= 0.55
+          ? (0.5 + (profile.adx14 - 25) / 50).clamp(0.5, 1.0)
+          : profile.adx14 < 20
+              ? 0.50  // 震荡市适合轮动
+              : 0.55;
+
+      // EMA 多头排列得分
+      final emaTrend = profile.emaTrendScore;
+
+      // RSI 背离加分
+      final divBonus = profile.bullishDivergence;
+
+      // 技术指标综合分 (新维度)
+      final technicalScore = (rsiScore * 0.22 +
+              bbScore * 0.15 +
+              adxScore * 0.13 +
+              emaTrend * 0.25 +
+              divBonus * 0.10 +
+              profile.obvTrend * 0.15)
+          .clamp(0.0, 1.0);
 
       final trendGuard =
-          (_clamp01((profile.thirtyDayReturn + 0.04) / 0.22) * 0.50 +
-                  _clamp01((profile.upRatio30 - 0.38) / 0.26) * 0.25 +
-                  _clamp01((0.26 - profile.drawdownFrom30High) / 0.26) * 0.25)
+          (_clamp01((profile.thirtyDayReturn + 0.04) / 0.22) * 0.40 +
+                  _clamp01((profile.upRatio30 - 0.38) / 0.26) * 0.20 +
+                  _clamp01((0.26 - profile.drawdownFrom30High) / 0.26) * 0.20 +
+                  // 新增：EMA 趋势确认
+                  emaTrend * 0.20)
               .clamp(0.0, 1.0);
 
-      var total = preset.rotationWeight * rotation +
-          preset.trendWeight * trend +
-          preset.compressionWeight * compression +
-          preset.triggerWeight * trigger +
-          preset.liquidityWeight * liquidity;
+      // 原始五维度占 70%，新技术指标占 30%
+      var total = (preset.rotationWeight * rotation +
+              preset.trendWeight * trend +
+              preset.compressionWeight * compression +
+              preset.triggerWeight * trigger +
+              preset.liquidityWeight * liquidity) *
+          0.70 +
+          technicalScore * 0.30;
 
       total *= 0.78 + trendGuard * 0.22;
+
+      // RSI 超买惩罚
+      if (profile.rsi14 > 75) {
+        total *= 0.88;
+      }
+      // MACD 死叉惩罚
+      if (profile.macdHistogram < -0.02 && profile.emaTrendScore < 0.5) {
+        total *= 0.90;
+      }
 
       if (profile.thirtyDayReturn < -0.12) {
         total *= 0.82;
@@ -567,22 +629,59 @@ class RecommendationEngine {
             ? 0.55
             : 0.15;
 
-    final entryScore = (trendScore * 0.35 +
-            _clamp01((volumeRatio - 0.8) / 0.8) * 0.25 +
-            _sweetSpot(breakoutDistance, 0.6, 1.4) * 0.20 +
-            _clamp01((coin.priceChangePercent + 1.5) / 6.5) * 0.20)
+    // 新增：小时级技术指标
+    final hourlyRsi = TechnicalIndicators.rsiLatest(closes);
+    final hourlyMacd = TechnicalIndicators.macdLatest(closes);
+    final hourlyBB = TechnicalIndicators.bollingerLatest(closes);
+
+    // RSI 进场评分：40-55 区间最佳（不超买，有动量）
+    final rsiEntryScore = hourlyRsi >= 35 && hourlyRsi <= 55
+        ? 0.85
+        : hourlyRsi < 30
+            ? 0.70 // 超卖可能反弹
+            : hourlyRsi > 70
+                ? 0.15 // 超买不追
+                : 0.50;
+
+    // MACD 金叉/柱状图方向
+    final macdEntryScore = hourlyMacd.crossover
+        ? 0.95
+        : hourlyMacd.histogram > 0 && hourlyMacd.histogram > hourlyMacd.prevHistogram
+            ? 0.75
+            : hourlyMacd.histogram > 0
+                ? 0.55
+                : 0.20;
+
+    // 布林带：接近中轨或下轨，且带宽适中
+    final bbEntryScore = hourlyBB.percentB <= 0.3
+        ? 0.80
+        : hourlyBB.percentB <= 0.55
+            ? 0.70
+            : hourlyBB.percentB <= 0.8
+                ? 0.40
+                : 0.15;
+
+    final entryScore = (trendScore * 0.22 +
+            rsiEntryScore * 0.18 +
+            macdEntryScore * 0.18 +
+            bbEntryScore * 0.10 +
+            _clamp01((volumeRatio - 0.8) / 0.8) * 0.15 +
+            _sweetSpot(breakoutDistance, 0.6, 1.4) * 0.10 +
+            _clamp01((coin.priceChangePercent + 1.5) / 6.5) * 0.07)
         .clamp(0.0, 1.0);
 
     final label = entryScore >= 0.76 && volumeRatio >= 1.05
         ? '可入场'
-        : entryScore >= 0.60
-            ? '临近买点'
-            : lastClose > ma21 && pullback <= 2
-                ? '等回踩'
-                : '继续等待';
+        : entryScore >= 0.68 && hourlyMacd.crossover
+            ? '可入场'
+            : entryScore >= 0.60
+                ? '临近买点'
+                : lastClose > ma21 && pullback <= 2
+                    ? '等回踩'
+                    : '继续等待';
 
     final reason =
-        '1h MA8 ${ma8 >= ma21 ? '站上' : '仍低于'} MA21；量比 ${volumeRatio.toStringAsFixed(2)}x；距12h突破位 ${breakoutDistance >= 0 ? '+' : ''}${breakoutDistance.toStringAsFixed(2)}%';
+        'RSI ${hourlyRsi.toStringAsFixed(0)} MACD${hourlyMacd.histogram > 0 ? "+" : ""}${hourlyMacd.crossover ? "金叉" : ""}；1h MA8 ${ma8 >= ma21 ? '站上' : '低于'} MA21；量比 ${volumeRatio.toStringAsFixed(2)}x；BB%B ${(hourlyBB.percentB * 100).toStringAsFixed(0)}%';
 
     final signal = EntryAlertSignal(
       symbol: coin.displayName,
@@ -715,6 +814,43 @@ class RecommendationEngine {
     final maxHigh7 = window7.map((bar) => bar.high).reduce(max);
     final minLow7 = window7.map((bar) => bar.low).reduce(min);
 
+    // 计算技术指标（使用 endIndex 之前的数据）
+    final indicatorBars = bars.sublist(0, endIndex + 1);
+    final indicatorCloses = indicatorBars.map((b) => b.close).toList();
+    final indicatorHighs = indicatorBars.map((b) => b.high).toList();
+    final indicatorLows = indicatorBars.map((b) => b.low).toList();
+    final indicatorVolumes = indicatorBars.map((b) => b.quoteVolume).toList();
+
+    final rsi14 = TechnicalIndicators.rsiLatest(indicatorCloses);
+    final macdSnap = TechnicalIndicators.macdLatest(indicatorCloses);
+    final bb = TechnicalIndicators.bollingerLatest(indicatorCloses);
+    final adx14 = indicatorHighs.length >= 30
+        ? TechnicalIndicators.adxLatest(
+            indicatorHighs, indicatorLows, indicatorCloses)
+        : 25.0;
+    final ema8 = TechnicalIndicators.emaLatest(indicatorCloses, 8);
+    final ema21 = TechnicalIndicators.emaLatest(indicatorCloses, 21);
+    final ema55 = indicatorCloses.length >= 55
+        ? TechnicalIndicators.emaLatest(indicatorCloses, 55)
+        : ema21;
+    final price = indicatorCloses.last;
+    double emaTrend;
+    if (price > ema8 && ema8 > ema21 && ema21 > ema55) {
+      emaTrend = 1.0;
+    } else if (price > ema21 && ema8 > ema21) {
+      emaTrend = 0.75;
+    } else if (price > ema21) {
+      emaTrend = 0.55;
+    } else if (price > ema55) {
+      emaTrend = 0.35;
+    } else {
+      emaTrend = 0.15;
+    }
+    final obvTrend =
+        TechnicalIndicators.obvTrendScore(indicatorCloses, indicatorVolumes);
+    final divScore =
+        TechnicalIndicators.bullishDivergenceScore(indicatorCloses);
+
     return _HistoricalProfile(
       symbol: symbol,
       thirtyDayReturn: thirtyDayReturn,
@@ -734,6 +870,15 @@ class RecommendationEngine {
           _average(window30.map((bar) => bar.quoteVolume).toList()),
       tradeCount: liveTradeCount ?? latest.tradeCount,
       turnStrength: threeDayReturn - sevenDayReturn,
+      rsi14: rsi14,
+      macdHistogram: macdSnap.histogram,
+      macdCrossover: macdSnap.crossover,
+      bollingerPercentB: bb.percentB,
+      bollingerBandwidth: bb.bandwidth,
+      adx14: adx14,
+      emaTrendScore: emaTrend,
+      obvTrend: obvTrend,
+      bullishDivergence: divScore,
     );
   }
 
@@ -781,26 +926,44 @@ class RecommendationEngine {
     final parts = <String>[
       '45天${profile.thirtyDayReturn >= 0 ? '+' : ''}${(profile.thirtyDayReturn * 100).toStringAsFixed(1)}%',
       '近7天${profile.sevenDayReturn >= 0 ? '+' : ''}${(profile.sevenDayReturn * 100).toStringAsFixed(1)}%',
-      '距上次大阳线 ${profile.daysSinceSurge} 天',
+      'RSI ${profile.rsi14.toStringAsFixed(0)}',
     ];
+
+    if (profile.macdCrossover) {
+      parts.add('MACD金叉');
+    } else if (profile.macdHistogram > 0) {
+      parts.add('MACD柱正向');
+    }
+
+    if (profile.emaTrendScore >= 0.75) {
+      parts.add('EMA多头排列');
+    } else if (profile.emaTrendScore <= 0.35) {
+      parts.add('EMA空头');
+    }
+
+    if (profile.bollingerBandwidth < 0.04) {
+      parts.add('布林收窄蓄势');
+    }
+
+    if (profile.bullishDivergence > 0.3) {
+      parts.add('RSI看涨背离');
+    }
+
+    if (profile.adx14 > 30) {
+      parts.add('趋势强(ADX${profile.adx14.toStringAsFixed(0)})');
+    }
 
     if (score.rotation >= 0.65) {
       parts.add('轮动补涨分高');
     }
     if (score.compression >= 0.65) {
-      parts.add('波动压缩明显');
-    }
-    if (score.trigger >= 0.65) {
-      parts.add('当下触发条件较好');
-    }
-    if (score.liquidity >= 0.70) {
-      parts.add('流动性靠前');
+      parts.add('波动压缩');
     }
     if (profile.thirtyDayReturn < 0 && profile.sevenDayReturn < 0) {
-      parts.add('趋势仍弱，先等企稳');
+      parts.add('趋势仍弱');
     }
 
-    parts.add('策略: ${preset.label}');
+    parts.add(preset.label);
     return parts.join('；');
   }
 
@@ -927,6 +1090,16 @@ class _HistoricalProfile {
   final double liquidityVolume;
   final int tradeCount;
   final double turnStrength;
+  // 新增技术指标
+  final double rsi14;
+  final double macdHistogram;
+  final bool macdCrossover;
+  final double bollingerPercentB;
+  final double bollingerBandwidth;
+  final double adx14;
+  final double emaTrendScore;
+  final double obvTrend;
+  final double bullishDivergence;
 
   const _HistoricalProfile({
     required this.symbol,
@@ -945,6 +1118,15 @@ class _HistoricalProfile {
     required this.liquidityVolume,
     required this.tradeCount,
     required this.turnStrength,
+    this.rsi14 = 50,
+    this.macdHistogram = 0,
+    this.macdCrossover = false,
+    this.bollingerPercentB = 0.5,
+    this.bollingerBandwidth = 0.05,
+    this.adx14 = 25,
+    this.emaTrendScore = 0.5,
+    this.obvTrend = 0.5,
+    this.bullishDivergence = 0,
   });
 }
 
