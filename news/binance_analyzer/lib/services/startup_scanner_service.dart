@@ -311,57 +311,6 @@ class StartupScannerService {
             marketScore * 0.14)
         .clamp(0.0, 1.0);
 
-    // 新增：RSI 评分 — 超卖区（30-50）适合启动买入，超买（>70）惩罚
-    double rsiScore;
-    final avgRsi = (profile.dailyRsi * 0.6 + profile.hourlyRsi * 0.4);
-    if (avgRsi <= 30) {
-      rsiScore = 0.70;
-    } else if (avgRsi <= 50) {
-      rsiScore = 0.70 + (avgRsi - 30) / 20 * 0.30;
-    } else if (avgRsi <= 65) {
-      rsiScore = 0.70;
-    } else if (avgRsi <= 75) {
-      rsiScore = 0.70 - (avgRsi - 65) / 10 * 0.35;
-    } else {
-      rsiScore = 0.20;
-    }
-
-    // 新增：MACD 信号评分
-    double macdScore = 0.5;
-    if (profile.dailyMacdCrossover || profile.hourlyMacdCrossover) {
-      macdScore = 0.95; // 金叉
-    } else if (profile.dailyMacdHistogram > 0 && profile.hourlyMacdHistogram > 0) {
-      macdScore = 0.75; // 双周期正向
-    } else if (profile.hourlyMacdHistogram > 0) {
-      macdScore = 0.60; // 短期正向
-    } else if (profile.dailyMacdHistogram < 0 && profile.hourlyMacdHistogram < 0) {
-      macdScore = 0.15; // 双周期负向
-    }
-
-    // 新增：布林带蓄势评分
-    double bbSqueezeScore = 0.5;
-    if (profile.bollingerBandwidth < 0.03) {
-      bbSqueezeScore = 0.95; // 极窄带宽，即将突破
-    } else if (profile.bollingerBandwidth < 0.05) {
-      bbSqueezeScore = 0.80;
-    } else if (profile.bollingerBandwidth < 0.08) {
-      bbSqueezeScore = 0.55;
-    } else {
-      bbSqueezeScore = 0.30;
-    }
-    // 价格在下轨附近且带宽收窄 → 额外加分
-    if (profile.bollingerPercentB < 0.3 && profile.bollingerBandwidth < 0.05) {
-      bbSqueezeScore = (bbSqueezeScore + 0.15).clamp(0.0, 1.0);
-    }
-
-    // 新增：ADX 趋势强度
-    final adxBonus = profile.adx > 25 && trendScore >= 0.6
-        ? 0.08 // 强趋势且方向正确时加分
-        : 0.0;
-
-    // 新增：OBV 量价配合
-    final obvBonus = profile.obvTrend > 0.65 ? 0.05 : 0.0;
-
     final overextendedPenalty = profile.momentum30 > 36 ||
             profile.coin.priceChangePercent > 8.6 ||
             profile.dailyBreakoutDistance > 2.8 ||
@@ -369,33 +318,52 @@ class StartupScannerService {
         ? 0.14
         : 0.0;
     final weakLiquidityPenalty = liquidityRank < 0.18 ? 0.04 : 0.0;
-    // 新增：RSI 超买惩罚
-    final rsiOverboughtPenalty = profile.dailyRsi > 75 || profile.hourlyRsi > 78
-        ? 0.10
-        : 0.0;
 
-    // 调整权重：原指标 70% + 新技术指标 30%
-    final baseScore = (trendScore * 0.22 +
+    // 原始评分（保持100%权重，不稀释）
+    var score = (trendScore * 0.22 +
             compressionScore * 0.20 +
             breakoutScore * 0.22 +
             volumeScore * 0.15 +
             pivotScore * 0.11 +
             momentumScore * 0.06 +
             liquidityRank * 0.03 +
-            marketScore * 0.01);
-    final techScore = (rsiScore * 0.30 +
-            macdScore * 0.30 +
-            bbSqueezeScore * 0.25 +
-            profile.obvTrend * 0.15);
-
-    final score = (baseScore * 0.70 +
-            techScore * 0.30 +
-            adxBonus +
-            obvBonus -
+            marketScore * 0.01 -
             weakLiquidityPenalty -
-            overextendedPenalty -
-            rsiOverboughtPenalty)
+            overextendedPenalty)
         .clamp(0.0, 1.0);
+
+    // ─── 技术指标乘数调整 ───
+
+    // MACD 金叉确认 → +8%
+    if (profile.dailyMacdCrossover || profile.hourlyMacdCrossover) {
+      score *= 1.08;
+    }
+    // MACD 双周期负向 → -5%
+    if (profile.dailyMacdHistogram < 0 && profile.hourlyMacdHistogram < 0) {
+      score *= 0.95;
+    }
+
+    // 布林带极窄(蓄势) + 趋势向好 → +6%
+    if (profile.bollingerBandwidth < 0.04 && trendScore >= 0.5) {
+      score *= 1.06;
+    }
+
+    // RSI 超买 → -10%
+    if (profile.dailyRsi > 78 || profile.hourlyRsi > 80) {
+      score *= 0.90;
+    }
+
+    // ADX 强趋势 + 方向正确 → +4%
+    if (profile.adx > 30 && trendScore >= 0.6) {
+      score *= 1.04;
+    }
+
+    // OBV 量价配合确认 → +4%
+    if (profile.obvTrend > 0.65) {
+      score *= 1.04;
+    }
+
+    score = score.clamp(0.0, 1.0);
 
     final shouldWatch = score >= policy.minWatchScore &&
         trendScore >= policy.minWatchTrendScore &&
